@@ -1,0 +1,22 @@
+# 让每一次 clone 都拿到逐字节相同的文件。
+#
+# 为什么需要：
+#   本工程的源码是 CRLF 且**无 BOM**（224 个 .c/.h 全部如此，已核实）。
+#   Keil / armclang 能容忍 LF，但一次静默的换行转换会带来两个后果：
+#     1. 产生一个巨大的、毫无意义的 diff，把真正的改动淹掉；
+#     2. 命令行 Keil 编译日志的尺寸与之前几次无法直接对比。
+#
+# 现在只在【本机】设了 core.autocrlf=false。换一台机器 clone（Windows 上
+# Git 的默认常常是 true）就会重新转换。所以把策略写进仓库本身。
+#
+# * -text  = 对所有文件关闭换行规范化，不做任何转换。
+* -text
+
+# 以下文件永远按二进制对待，不参与 diff / merge。
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.hex binary
+*.axf binary
+*.bin binary
