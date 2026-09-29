@@ -62,25 +62,24 @@ static uint32_t friction_test_limit_duration(uint32_t duration_ms)
 /** 向整个发射机构写入零电流并更新测试显示值。 */
 static void friction_test_stop_output(void)
 {
-    robot_shooter_set_command(0, 0, 0, 0, 0, 0);
+    robot_shooter_set_command(0, 0, 0);
     g_friction_test_status.applied_current = 0;
 }
 
 /** 仅对选中的一个摩擦轮施加测试电流，其余通道保持为零。 */
 static void friction_test_apply_output(uint8_t motor_index, int16_t current)
 {
-    int16_t friction[4] = {0, 0, 0, 0};
+    int16_t friction[ROBOT_FRICTION_MOTOR_COUNT] = {0, 0};
 
-    if (motor_index < 4U)
+    if (motor_index < ROBOT_FRICTION_MOTOR_COUNT)
     {
         friction[motor_index] = current;
     }
 
-    robot_shooter_set_command(
-        friction[0], friction[1], friction[2], friction[3], 0, 0);
+    robot_shooter_set_command(friction[0], friction[1], 0);
 }
 
-/** 汇总四个摩擦轮反馈以及 CAN 收发统计，供调试器观察。 */
+/** 汇总摩擦轮反馈以及 CAN 收发统计，供调试器观察。 */
 static void friction_test_update_status(void)
 {
     robot_motor_state_t motors;
@@ -91,7 +90,7 @@ static void friction_test_update_status(void)
     robot_motors_get_snapshot(&motors);
     can_tx_service_get_stats(&tx_stats);
 
-    for (index = 0U; index < 4U; index++)
+    for (index = 0U; index < ROBOT_FRICTION_MOTOR_COUNT; index++)
     {
         const dji_motor_feedback_t *feedback =
             &motors.shooter.friction[index];
@@ -141,7 +140,7 @@ static void friction_test_task(void *argument)
 
         if (g_friction_test_command.enabled && !was_enabled)
         {
-            if (motor_index < 4U)
+            if (motor_index < ROBOT_FRICTION_MOTOR_COUNT)
             {
                 start_tick = osKernelGetTickCount();
                 duration_ticks = pdMS_TO_TICKS(friction_test_limit_duration(

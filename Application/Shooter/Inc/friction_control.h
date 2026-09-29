@@ -1,26 +1,28 @@
 #ifndef FRICTION_CONTROL_H
 #define FRICTION_CONTROL_H
 
+#include "robot_motor_config.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
 typedef struct
 {
     volatile bool enabled;
-    volatile int16_t target_rpm[4];
+    volatile int16_t target_rpm[ROBOT_FRICTION_MOTOR_COUNT];
 } friction_control_command_t;
 
 typedef struct
 {
     volatile bool running;
-    volatile bool online[4];
-    volatile int16_t target_rpm[4];
-    volatile int16_t measured_rpm[4];
-    volatile int16_t output_current[4];
-    volatile float error[4];
-    volatile float p_output[4];
-    volatile float i_output[4];
-    volatile float d_output[4];
+    volatile bool online[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile int16_t target_rpm[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile int16_t measured_rpm[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile int16_t output_current[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile float error[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile float p_output[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile float i_output[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile float d_output[ROBOT_FRICTION_MOTOR_COUNT];
     volatile uint32_t update_count;
 } friction_control_status_t;
 

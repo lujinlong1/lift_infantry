@@ -21,16 +21,16 @@ friction_control_command_t g_friction_control_command;
 friction_control_status_t g_friction_control_status;
 friction_control_debug_t g_friction_control_debug;
 
-static pid_controller_t friction_pid[4];
+static pid_controller_t friction_pid[ROBOT_FRICTION_MOTOR_COUNT];
 static osThreadId_t friction_control_task_handle;
 static StaticTask_t friction_control_task_control;
 static StackType_t friction_control_task_stack[FRICTION_TASK_STACK_WORDS];
 
-/** 清空四个摩擦轮速度 PID 的历史状态。 */
+/** 清空全部摩擦轮速度 PID 的历史状态。 */
 static void friction_reset_pid(void)
 {
     uint32_t i;
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
     {
         pid_reset(&friction_pid[i]);
     }
@@ -46,7 +46,7 @@ static int16_t friction_limit_rpm(int16_t rpm)
     return rpm;
 }
 
-/** 校验在线调试参数，并同步应用到四个摩擦轮 PID。 */
+/** 校验在线调试参数，并同步应用到全部摩擦轮 PID。 */
 static void friction_apply_debug(void)
 {
     pid_config_t config;
@@ -62,15 +62,15 @@ static void friction_apply_debug(void)
         g_friction_control_debug.integral_limit = 0.0F;
     if (g_friction_control_debug.output_limit < 0.0F)
         g_friction_control_debug.output_limit = 0.0F;
-    if (g_friction_control_debug.output_limit > 16384.0F)
-        g_friction_control_debug.output_limit = 16384.0F;
+    if (g_friction_control_debug.output_limit > (float)ROBOT_2006_CURRENT_LIMIT)
+        g_friction_control_debug.output_limit = (float)ROBOT_2006_CURRENT_LIMIT;
 
     config.kp = g_friction_control_debug.kp;
     config.ki = g_friction_control_debug.ki;
     config.kd = g_friction_control_debug.kd;
     config.integral_limit = g_friction_control_debug.integral_limit;
     config.output_limit = g_friction_control_debug.output_limit;
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         friction_pid[i].config = config;
     friction_reset_pid();
     g_friction_control_debug.apply = false;
@@ -80,20 +80,20 @@ static void friction_apply_debug(void)
 static void friction_stop(void)
 {
     friction_reset_pid();
-    robot_shooter_set_friction_currents(0, 0, 0, 0);
+    robot_shooter_set_friction_currents(0, 0);
     g_friction_control_status.running = false;
-    for (uint32_t i = 0U; i < 4U; i++)
+    for (uint32_t i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         g_friction_control_status.output_current[i] = 0;
 }
 
 /**
- * @brief 四摩擦轮同步速度闭环任务。
- * @note 四个反馈必须全部在线才允许输出，避免缺轮时继续发射。
+ * @brief 摩擦轮同步速度闭环任务。
+ * @note 全部反馈必须在线才允许输出，避免缺轮时继续发射。
  */
 static void friction_task(void *argument)
 {
     robot_motor_state_t motors;
-    int16_t output[4];
+    int16_t output[ROBOT_FRICTION_MOTOR_COUNT];
     uint32_t i;
     bool all_online;
     const float dt = (float)FRICTION_PERIOD_MS / 1000.0F;
@@ -112,7 +112,7 @@ static void friction_task(void *argument)
 
         robot_motors_get_snapshot(&motors);
         all_online = true;
-        for (i = 0U; i < 4U; i++)
+        for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         {
             g_friction_control_status.target_rpm[i] =
                 friction_limit_rpm(g_friction_control_command.target_rpm[i]);
@@ -132,7 +132,7 @@ static void friction_task(void *argument)
         }
         else
         {
-            for (i = 0U; i < 4U; i++)
+            for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
             {
                 output[i] = (int16_t)pid_calculate(
                     &friction_pid[i],
@@ -145,8 +145,7 @@ static void friction_task(void *argument)
                 g_friction_control_status.i_output[i] = friction_pid[i].i_output;
                 g_friction_control_status.d_output[i] = friction_pid[i].d_output;
             }
-            robot_shooter_set_friction_currents(
-                output[0], output[1], output[2], output[3]);
+            robot_shooter_set_friction_currents(output[0], output[1]);
             g_friction_control_status.running = true;
         }
         g_friction_control_status.update_count++;
@@ -154,7 +153,7 @@ static void friction_task(void *argument)
     }
 }
 
-/** 初始化摩擦轮控制命令、状态和四个相同的速度 PID。 */
+/** 初始化摩擦轮控制命令、状态和全部相同的速度 PID。 */
 void friction_control_init(void)
 {
     const pid_config_t config = {4.0F, 0.8F, 0.0F,
@@ -168,7 +167,7 @@ void friction_control_init(void)
     g_friction_control_debug.ki = config.ki;
     g_friction_control_debug.integral_limit = config.integral_limit;
     g_friction_control_debug.output_limit = config.output_limit;
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         pid_init(&friction_pid[i], &config);
 }
 

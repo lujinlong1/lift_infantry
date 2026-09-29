@@ -1,6 +1,8 @@
 #ifndef ROBOT_MOTOR_COMMANDS_H
 #define ROBOT_MOTOR_COMMANDS_H
 
+#include "robot_motor_config.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -25,11 +27,9 @@ typedef struct
 
 typedef struct
 {
-    int16_t friction[4];
-    int16_t projectile_feeder_current;
+    int16_t friction[ROBOT_FRICTION_MOTOR_COUNT];
     int16_t trigger_current;
     uint32_t friction_update_tick;
-    uint32_t projectile_feeder_update_tick;
     uint32_t trigger_update_tick;
 } shooter_motor_commands_t;
 
@@ -88,20 +88,13 @@ void robot_gimbal_request_pitch_enable(bool enable);
 void robot_shooter_set_command(
     int16_t friction1,
     int16_t friction2,
-    int16_t friction3,
-    int16_t friction4,
-    int16_t projectile_feeder_current,
     int16_t trigger_current);
 
 void robot_shooter_set_friction_currents(
     int16_t friction1,
-    int16_t friction2,
-    int16_t friction3,
-    int16_t friction4);
+    int16_t friction2);
 
-void robot_shooter_set_feed_currents(
-    int16_t projectile_feeder_current,
-    int16_t trigger_current);
+void robot_shooter_set_feed_currents(int16_t trigger_current);
 
 void robot_motor_commands_get_snapshot(robot_motor_commands_t *snapshot);
 

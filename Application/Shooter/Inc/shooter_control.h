@@ -1,6 +1,8 @@
 #ifndef SHOOTER_CONTROL_H
 #define SHOOTER_CONTROL_H
 
+#include "robot_motor_config.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -30,8 +32,7 @@ typedef struct
 
 typedef struct
 {
-    volatile int16_t friction_rpm[4];
-    volatile int16_t projectile_feeder_rpm;
+    volatile int16_t friction_rpm[ROBOT_FRICTION_MOTOR_COUNT];
     volatile int16_t trigger_rpm;
     volatile int8_t feed_direction;
     volatile int32_t trigger_ecd_per_shot;

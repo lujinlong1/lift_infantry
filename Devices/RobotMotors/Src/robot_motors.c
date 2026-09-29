@@ -63,27 +63,9 @@ bool robot_motors_process_frame(const can_rx_frame_t *frame)
                     frame,
                     current_tick);
 
-            case ROBOT_PROJECTILE_FEEDER_ID:
-                return robot_motors_decode_dji(
-                    &g_robot_motors.shooter.projectile_feeder,
-                    frame,
-                    current_tick);
-
             case ROBOT_FRICTION_MOTOR_2_ID:
                 return robot_motors_decode_dji(
                     &g_robot_motors.shooter.friction[1],
-                    frame,
-                    current_tick);
-
-            case ROBOT_FRICTION_MOTOR_3_ID:
-                return robot_motors_decode_dji(
-                    &g_robot_motors.shooter.friction[2],
-                    frame,
-                    current_tick);
-
-            case ROBOT_FRICTION_MOTOR_4_ID:
-                return robot_motors_decode_dji(
-                    &g_robot_motors.shooter.friction[3],
                     frame,
                     current_tick);
 

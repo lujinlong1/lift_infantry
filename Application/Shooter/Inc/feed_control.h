@@ -1,12 +1,14 @@
 #ifndef FEED_CONTROL_H
 #define FEED_CONTROL_H
 
+#include "robot_motor_config.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
-#define FEED_MOTOR_PROJECTILE 0U
-#define FEED_MOTOR_TRIGGER    1U
-#define FEED_MOTOR_COUNT      2U
+/* 本车只有一个拨弹盘（M2006），送弹轮已取消。 */
+#define FEED_MOTOR_TRIGGER    0U
+#define FEED_MOTOR_COUNT      ROBOT_FEED_MOTOR_COUNT
 
 typedef struct
 {

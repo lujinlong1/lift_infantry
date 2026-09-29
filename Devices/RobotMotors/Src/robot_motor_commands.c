@@ -357,12 +357,6 @@ static void robot_motor_tx_task(void *argument)
                          sizeof(commands.shooter.friction));
         }
         if (!command_is_fresh(
-                current_tick,
-                commands.shooter.projectile_feeder_update_tick))
-        {
-            commands.shooter.projectile_feeder_current = 0;
-        }
-        if (!command_is_fresh(
                 current_tick, commands.shooter.trigger_update_tick))
         {
             commands.shooter.trigger_current = 0;
@@ -403,25 +397,18 @@ static void robot_motor_tx_task(void *argument)
             test_command_id,
             test_currents);
 
-        send_dji_group_with_test_override(
-            CAN_BUS_1,
-            ROBOT_DJI_COMMAND_ID_1_TO_4,
-            0,
-            0,
-            0,
-            commands.shooter.friction[0],
-            test_ready,
-            test_bus,
-            test_command_id,
-            test_currents);
-
+        /*
+         * CAN1 0x200 已腾空，将由抬升组（LIFT-004）占用。
+         * 当前不发送全零帧，避免白占总线带宽。
+         * CAN1 0x1FF = { 预留Pitch, 摩擦轮1, 摩擦轮2, 预留 }。
+         */
         send_dji_group_with_test_override(
             CAN_BUS_1,
             ROBOT_DJI_COMMAND_ID_5_TO_8,
-            commands.shooter.projectile_feeder_current,
+            0,
+            commands.shooter.friction[0],
             commands.shooter.friction[1],
-            commands.shooter.friction[2],
-            commands.shooter.friction[3],
+            0,
             test_ready,
             test_bus,
             test_command_id,
@@ -571,28 +558,22 @@ void robot_gimbal_request_pitch_enable(bool enable)
 void robot_shooter_set_command(
     int16_t friction1,
     int16_t friction2,
-    int16_t friction3,
-    int16_t friction4,
-    int16_t projectile_feeder_current,
     int16_t trigger_current)
 {
-    const int16_t friction[4] = {
-        friction1, friction2, friction3, friction4};
+    const int16_t friction[ROBOT_FRICTION_MOTOR_COUNT] = {
+        friction1, friction2};
     uint32_t index;
     const uint32_t tick = osKernelGetTickCount();
 
     taskENTER_CRITICAL();
-    for (index = 0U; index < 4U; index++)
+    for (index = 0U; index < ROBOT_FRICTION_MOTOR_COUNT; index++)
     {
         command_cache.shooter.friction[index] =
-            clamp_current(friction[index], ROBOT_3508_CURRENT_LIMIT);
+            clamp_current(friction[index], ROBOT_2006_CURRENT_LIMIT);
     }
-    command_cache.shooter.projectile_feeder_current =
-        clamp_current(projectile_feeder_current, ROBOT_2006_CURRENT_LIMIT);
     command_cache.shooter.trigger_current =
-        clamp_current(trigger_current, ROBOT_3508_CURRENT_LIMIT);
+        clamp_current(trigger_current, ROBOT_TRIGGER_CURRENT_LIMIT);
     command_cache.shooter.friction_update_tick = tick;
-    command_cache.shooter.projectile_feeder_update_tick = tick;
     command_cache.shooter.trigger_update_tick = tick;
     taskEXIT_CRITICAL();
 }
@@ -600,38 +581,31 @@ void robot_shooter_set_command(
 /** 独立更新四个摩擦轮电流，避免覆盖拨弹控制任务的命令。 */
 void robot_shooter_set_friction_currents(
     int16_t friction1,
-    int16_t friction2,
-    int16_t friction3,
-    int16_t friction4)
+    int16_t friction2)
 {
-    const int16_t friction[4] = {
-        friction1, friction2, friction3, friction4};
+    const int16_t friction[ROBOT_FRICTION_MOTOR_COUNT] = {
+        friction1, friction2};
     uint32_t index;
     const uint32_t tick = osKernelGetTickCount();
 
     taskENTER_CRITICAL();
-    for (index = 0U; index < 4U; index++)
+    for (index = 0U; index < ROBOT_FRICTION_MOTOR_COUNT; index++)
     {
         command_cache.shooter.friction[index] =
-            clamp_current(friction[index], ROBOT_3508_CURRENT_LIMIT);
+            clamp_current(friction[index], ROBOT_2006_CURRENT_LIMIT);
     }
     command_cache.shooter.friction_update_tick = tick;
     taskEXIT_CRITICAL();
 }
 
 /** 独立更新供弹轮和拨盘电流，避免覆盖摩擦轮控制任务的命令。 */
-void robot_shooter_set_feed_currents(
-    int16_t projectile_feeder_current,
-    int16_t trigger_current)
+void robot_shooter_set_feed_currents(int16_t trigger_current)
 {
     const uint32_t tick = osKernelGetTickCount();
 
     taskENTER_CRITICAL();
-    command_cache.shooter.projectile_feeder_current =
-        clamp_current(projectile_feeder_current, ROBOT_2006_CURRENT_LIMIT);
     command_cache.shooter.trigger_current =
-        clamp_current(trigger_current, ROBOT_3508_CURRENT_LIMIT);
-    command_cache.shooter.projectile_feeder_update_tick = tick;
+        clamp_current(trigger_current, ROBOT_TRIGGER_CURRENT_LIMIT);
     command_cache.shooter.trigger_update_tick = tick;
     taskEXIT_CRITICAL();
 }

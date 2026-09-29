@@ -4,6 +4,7 @@
 #include "can_rx_service.h"
 #include "dji_motor.h"
 #include "dm_motor.h"
+#include "robot_motor_config.h"
 
 #include <stdbool.h>
 
@@ -20,8 +21,7 @@ typedef struct
 
 typedef struct
 {
-    dji_motor_feedback_t friction[4];
-    dji_motor_feedback_t projectile_feeder;
+    dji_motor_feedback_t friction[ROBOT_FRICTION_MOTOR_COUNT];
     dji_motor_feedback_t trigger;
 } shooter_motors_t;
 

@@ -34,18 +34,13 @@ static void shooter_validate_debug(void)
 {
     uint32_t index;
 
-    for (index = 0U; index < 4U; index++)
+    for (index = 0U; index < ROBOT_FRICTION_MOTOR_COUNT; index++)
     {
         if (g_shooter_control_debug.friction_rpm[index] < 0)
         {
             g_shooter_control_debug.friction_rpm[index] =
                 (int16_t)-g_shooter_control_debug.friction_rpm[index];
         }
-    }
-    if (g_shooter_control_debug.projectile_feeder_rpm < 0)
-    {
-        g_shooter_control_debug.projectile_feeder_rpm =
-            (int16_t)-g_shooter_control_debug.projectile_feeder_rpm;
     }
     if (g_shooter_control_debug.trigger_rpm < 0)
     {
@@ -80,24 +75,21 @@ static void shooter_set_state(shooter_state_t state, uint32_t tick)
     (void)tick;
 }
 
-/** 设置四个摩擦轮的目标转速和总使能。 */
+/** 设置全部摩擦轮的目标转速和总使能。 */
 static void shooter_set_friction(bool enabled)
 {
     uint32_t i;
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         g_friction_control_command.target_rpm[i] =
             g_shooter_control_debug.friction_rpm[i];
     g_friction_control_command.enabled = enabled;
 }
 
-/** 按指定方向设置供弹轮和拨盘的目标转速及使能。 */
+/** 按指定方向设置拨弹盘目标转速及使能。 */
 static void shooter_set_feed(bool enabled, int8_t direction)
 {
-    g_feed_control_command.target_rpm[FEED_MOTOR_PROJECTILE] =
-        (int16_t)(direction * g_shooter_control_debug.projectile_feeder_rpm);
     g_feed_control_command.target_rpm[FEED_MOTOR_TRIGGER] =
         (int16_t)(direction * g_shooter_control_debug.trigger_rpm);
-    g_feed_control_command.enabled[FEED_MOTOR_PROJECTILE] = enabled;
     g_feed_control_command.enabled[FEED_MOTOR_TRIGGER] = enabled;
 }
 
@@ -109,11 +101,11 @@ static void shooter_stop_all(void)
     g_shooter_control_status.ready = false;
 }
 
-/** 判断四个摩擦轮是否全部在线且速度误差进入允许范围。 */
+/** 判断全部摩擦轮是否在线且速度误差进入允许范围。 */
 static bool shooter_friction_is_stable(void)
 {
     uint32_t i;
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
     {
         if (!g_friction_control_status.online[i] ||
             (shooter_abs_i32(
@@ -159,13 +151,9 @@ static void shooter_task(void *argument)
         shooter_validate_debug();
         robot_motors_get_snapshot(&motors);
         feed_online = dji_motor_feedback_is_online(
-                          &motors.shooter.projectile_feeder,
-                          now,
-                          pdMS_TO_TICKS(100U)) &&
-                      dji_motor_feedback_is_online(
-                          &motors.shooter.trigger,
-                          now,
-                          pdMS_TO_TICKS(100U));
+            &motors.shooter.trigger,
+            now,
+            pdMS_TO_TICKS(100U));
         g_shooter_control_status.trigger_current_ecd =
             motors.shooter.trigger.total_ecd;
         g_shooter_control_status.state_elapsed_ms =
@@ -368,9 +356,8 @@ void shooter_control_init(void)
                  sizeof(g_shooter_control_status));
     (void)memset(&g_shooter_control_debug, 0,
                  sizeof(g_shooter_control_debug));
-    for (i = 0U; i < 4U; i++)
+    for (i = 0U; i < ROBOT_FRICTION_MOTOR_COUNT; i++)
         g_shooter_control_debug.friction_rpm[i] = 3000;
-    g_shooter_control_debug.projectile_feeder_rpm = 1000;
     g_shooter_control_debug.trigger_rpm = 1000;
     g_shooter_control_debug.feed_direction = 1;
     g_shooter_control_debug.trigger_ecd_per_shot = 19661;

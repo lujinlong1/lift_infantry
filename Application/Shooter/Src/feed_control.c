@@ -23,10 +23,11 @@ static osThreadId_t feed_task_handle;
 static StaticTask_t feed_task_control;
 static StackType_t feed_task_stack[FEED_TASK_STACK_WORDS];
 
-/** 按两种拨弹电机各自的允许范围限制目标转速。 */
+/** 限制拨弹盘目标转速。M2006 经 C610 驱动，上限按机构取 10000 rpm。 */
 static int16_t feed_limit_rpm(uint32_t index, int16_t rpm)
 {
-    const int16_t limit = index == FEED_MOTOR_PROJECTILE ? 10000 : 12000;
+    const int16_t limit = 10000;
+    (void)index;
     if (rpm > limit)
         return limit;
     if (rpm < -limit)
@@ -34,7 +35,7 @@ static int16_t feed_limit_rpm(uint32_t index, int16_t rpm)
     return rpm;
 }
 
-/** 清空两个拨弹电机速度 PID 的历史状态。 */
+/** 清空拨弹盘速度 PID 的历史状态。 */
 static void feed_reset(void)
 {
     uint32_t i;
@@ -42,13 +43,13 @@ static void feed_reset(void)
         pid_reset(&feed_pid[i]);
 }
 
-/** 校验在线调试参数并更新两个拨弹电机的 PID 配置。 */
+/** 校验在线调试参数并更新拨弹盘的 PID 配置。 */
 static void feed_apply_debug(void)
 {
     uint32_t i;
     for (i = 0U; i < FEED_MOTOR_COUNT; i++)
     {
-        float protocol_limit = i == FEED_MOTOR_PROJECTILE ? 10000.0F : 16384.0F;
+        const float protocol_limit = (float)ROBOT_2006_CURRENT_LIMIT;
         if (g_feed_control_debug.integral_limit[i] < 0.0F)
             g_feed_control_debug.integral_limit[i] = 0.0F;
         if (g_feed_control_debug.output_limit[i] < 0.0F)
@@ -67,7 +68,7 @@ static void feed_apply_debug(void)
 
 /**
  * @brief 拨弹机构速度闭环任务。
- * @note 两个电机分别判断使能和在线状态，任一电机停机不会掩盖另一个电机的状态。
+ * @note 拨弹盘单独判断使能和在线状态，离线立即停止输出。
  */
 static void feed_task(void *argument)
 {
@@ -90,7 +91,6 @@ static void feed_task(void *argument)
         }
 
         robot_motors_get_snapshot(&motors);
-        feedback[FEED_MOTOR_PROJECTILE] = &motors.shooter.projectile_feeder;
         feedback[FEED_MOTOR_TRIGGER] = &motors.shooter.trigger;
 
         for (i = 0U; i < FEED_MOTOR_COUNT; i++)
@@ -124,18 +124,17 @@ static void feed_task(void *argument)
             g_feed_control_status.d_output[i] = feed_pid[i].d_output;
         }
 
-        robot_shooter_set_feed_currents(output[0], output[1]);
+        robot_shooter_set_feed_currents(output[0]);
         g_feed_control_status.update_count++;
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(FEED_PERIOD_MS));
     }
 }
 
-/** 初始化拨弹命令、状态以及两个速度环的默认参数。 */
+/** 初始化拨弹命令、状态以及拨弹盘速度环的默认参数。 */
 void feed_control_init(void)
 {
     const pid_config_t configs[FEED_MOTOR_COUNT] = {
-        {4.0F, 0.5F, 0.0F, 8000.0F, 2000.0F},
-        {4.0F, 0.8F, 0.0F, 12000.0F, 3000.0F}};
+        {4.0F, 0.8F, 0.0F, 8000.0F, 3000.0F}};
     uint32_t i;
     (void)memset(&g_feed_control_command, 0, sizeof(g_feed_control_command));
     (void)memset(&g_feed_control_status, 0, sizeof(g_feed_control_status));

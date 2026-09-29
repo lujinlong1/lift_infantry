@@ -1,6 +1,8 @@
 #ifndef FRICTION_TEST_TASK_H
 #define FRICTION_TEST_TASK_H
 
+#include "robot_motor_config.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -19,12 +21,12 @@ typedef struct
     volatile int16_t applied_current;
     volatile uint32_t elapsed_ms;
 
-    volatile uint16_t ecd[4];
-    volatile int16_t speed_rpm[4];
-    volatile int16_t feedback_current[4];
-    volatile uint8_t temperature[4];
-    volatile uint32_t update_count[4];
-    volatile bool online[4];
+    volatile uint16_t ecd[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile int16_t speed_rpm[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile int16_t feedback_current[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile uint8_t temperature[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile uint32_t update_count[ROBOT_FRICTION_MOTOR_COUNT];
+    volatile bool online[ROBOT_FRICTION_MOTOR_COUNT];
 
     volatile uint32_t can_rx_count;
     volatile uint32_t can_rx_dropped;
