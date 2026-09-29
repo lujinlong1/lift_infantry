@@ -1,0 +1,39 @@
+# Keil build output
+*.o
+*.d
+*.crf
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.lnp
+*.dep
+*.iex
+*.htm
+*.html
+*.log
+*.uvguix.*
+
+/MDK-ARM/lift_infantry/
+/MDK-ARM/*_backup_*/
+/MDK-ARM/JLinkLog.txt
+
+# Local recovery copies
+/.codex_backup/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Downloaded external repositories. Keep only our review documents.
+/强队资料/basic_framework/
+/强队资料/RM2021_Hero/
+/强队资料/RM2024_PowerCore/
+/强队资料/rm_auto_aim/
+/强队资料/StandardRobotpp/
+/强队资料/XRobot/
+

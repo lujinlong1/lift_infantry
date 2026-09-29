@@ -1,0 +1,19 @@
+; STM32F407 memory layout.
+; DMA-accessed sections must be selected into SRAM before the generic regions.
+
+LR_IROM1 0x08000000 0x00100000  {
+  ER_IROM1 0x08000000 0x00100000  {
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+    .ANY (+XO)
+  }
+  RW_IRAM1 0x20000000 0x00020000  {
+    * (.bss.dbus_dma_buffer)
+    * (.bss.telemetry_dma_buffer)
+    .ANY (+RW +ZI)
+  }
+  RW_IRAM2 0x10000000 0x00010000  {
+    .ANY (+RW +ZI)
+  }
+}
