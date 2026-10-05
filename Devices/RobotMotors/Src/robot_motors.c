@@ -45,18 +45,14 @@ bool robot_motors_process_frame(const can_rx_frame_t *frame)
 
     if (frame->bus == CAN_BUS_1)
     {
-        if (frame->std_id == ROBOT_DM_PITCH_RX_ID)
-        {
-            return dm_motor_decode_mit_feedback(
-                &g_robot_motors.gimbal.pitch,
-                ROBOT_DM_PITCH_MOTOR_ID,
-                frame->data,
-                frame->dlc,
-                current_tick);
-        }
-
         switch (frame->std_id)
         {
+            case ROBOT_PITCH_MOTOR_ID:
+                return robot_motors_decode_dji(
+                    &g_robot_motors.gimbal.pitch,
+                    frame,
+                    current_tick);
+
             case ROBOT_FRICTION_MOTOR_1_ID:
                 return robot_motors_decode_dji(
                     &g_robot_motors.shooter.friction[0],

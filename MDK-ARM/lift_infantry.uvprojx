@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Application/Inc;../Bsp/Inc;../Services/Can/Inc;../Services/AutoAim/Inc;../Devices/DjiMotor/Inc;../Config/Inc;../Devices/DmMotor/Inc;../Devices/RobotMotors/Inc;../Diagnostics/MotorTest/Inc;../Diagnostics/Telemetry/Inc;../Diagnostics/RuntimeMonitor/Inc;../Algorithms/Pid/Inc;../Application/Chassis/Inc;../Application/Shooter/Inc;../Application/Gimbal/Inc;../Services/Remote/Inc;../Application/Remote/Inc;../Middlewares/ST/STM32_USB_Device_Library/Core/Inc;../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc</IncludePath>
+              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Application/Inc;../Bsp/Inc;../Services/Can/Inc;../Services/AutoAim/Inc;../Devices/DjiMotor/Inc;../Config/Inc;../Devices/RobotMotors/Inc;../Diagnostics/MotorTest/Inc;../Diagnostics/Telemetry/Inc;../Diagnostics/RuntimeMonitor/Inc;../Algorithms/Pid/Inc;../Application/Chassis/Inc;../Application/Shooter/Inc;../Application/Gimbal/Inc;../Services/Remote/Inc;../Application/Remote/Inc;../Middlewares/ST/STM32_USB_Device_Library/Core/Inc;../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -359,7 +359,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;..\Application\Inc;..\Bsp\Inc;..\Services\Can\Inc;..\Devices\DjiMotor\Inc;..\Config\Inc;..\Devices\DmMotor\Inc;..\Devices\RobotMotors\Inc;..\Diagnostics\MotorTest\Inc;..\Diagnostics\RuntimeMonitor\Inc;..\Algorithms\Pid\Inc;..\Application\Chassis\Inc;..\Application\Shooter\Inc;..\Application\Gimbal\Inc;..\Services\Remote\Inc;..\Application\Remote\Inc</IncludePath>
+              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;..\Application\Inc;..\Bsp\Inc;..\Services\Can\Inc;..\Devices\DjiMotor\Inc;..\Config\Inc;..\Devices\RobotMotors\Inc;..\Diagnostics\MotorTest\Inc;..\Diagnostics\RuntimeMonitor\Inc;..\Algorithms\Pid\Inc;..\Application\Chassis\Inc;..\Application\Shooter\Inc;..\Application\Gimbal\Inc;..\Services\Remote\Inc;..\Application\Remote\Inc</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -1111,21 +1111,6 @@
               <FileName>dji_motor.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Devices\DjiMotor\Inc\dji_motor.h</FilePath>
-            </File>
-          </Files>
-        </Group>
-        <Group>
-          <GroupName>Devices/DmMotor</GroupName>
-          <Files>
-            <File>
-              <FileName>dm_motor.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Devices\DmMotor\Src\dm_motor.c</FilePath>
-            </File>
-            <File>
-              <FileName>dm_motor.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\Devices\DmMotor\Inc\dm_motor.h</FilePath>
             </File>
           </Files>
         </Group>

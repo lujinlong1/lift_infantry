@@ -14,15 +14,10 @@ typedef struct
 
 typedef struct
 {
-    float pitch_position;
-    float pitch_velocity;
-    float pitch_kp;
-    float pitch_kd;
-    float pitch_torque;
+    int16_t pitch_current;
     uint32_t pitch_update_tick;
     int16_t yaw_current;
     uint32_t yaw_update_tick;
-    bool pitch_enable_requested;
 } gimbal_motor_commands_t;
 
 typedef struct
@@ -76,14 +71,12 @@ void robot_chassis_set_currents(
 
 void robot_gimbal_set_yaw_current(int16_t current);
 
-void robot_gimbal_set_pitch_mit(
-    float position,
-    float velocity,
-    float kp,
-    float kd,
-    float torque);
-
-void robot_gimbal_request_pitch_enable(bool enable);
+/*
+ * Pitch 由 GM6020 驱动，闭环在 MCU 内完成（串级 PID 见 pitch_control.c），
+ * 设备层只负责把这一个电压量送进 CAN1 0x1FF 槽 1。
+ * 注意量纲：GM6020 走 0x1FF 时收的是电压(±30000)，不是电流。
+ */
+void robot_gimbal_set_pitch_current(int16_t current);
 
 void robot_shooter_set_command(
     int16_t friction1,

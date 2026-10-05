@@ -3,7 +3,6 @@
 #include "can_tx_service.h"
 #include "cmsis_os2.h"
 #include "dji_motor.h"
-#include "dm_motor.h"
 #include "FreeRTOS.h"
 #include "robot_motor_config.h"
 #include "robot_motors.h"
@@ -264,67 +263,15 @@ static void send_dji_group_with_test_override(
         bus, command_id, motor1, motor2, motor3, motor4);
 }
 
-/** 发送达妙 Pitch 电机的使能或失能特殊命令。 */
-static bool send_dm_special(bool enable)
-{
-    uint8_t data[8];
-
-    if (enable)
-    {
-        dm_motor_pack_enable_command(data);
-    }
-    else
-    {
-        dm_motor_pack_disable_command(data);
-    }
-
-    return can_tx_service_send(
-               CAN_BUS_1,
-               ROBOT_DM_PITCH_TX_ID,
-               data,
-               8U) == CAN_TX_SERVICE_OK;
-}
-
-/** 发送 Pitch MIT 命令；命令超时时发送全部为零的无力参数。 */
-static void send_dm_mit(
-    const gimbal_motor_commands_t *gimbal,
-    bool command_fresh)
-{
-    uint8_t data[8];
-
-    if (command_fresh)
-    {
-        dm_motor_pack_mit_command(
-            data,
-            gimbal->pitch_position,
-            gimbal->pitch_velocity,
-            gimbal->pitch_kp,
-            gimbal->pitch_kd,
-            gimbal->pitch_torque);
-    }
-    else
-    {
-        dm_motor_pack_mit_command(data, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
-    }
-
-    (void)can_tx_service_send(
-        CAN_BUS_1, ROBOT_DM_PITCH_TX_ID, data, 8U);
-}
-
 /**
  * @brief 全车电机 CAN 命令的唯一发送任务。
- * @note 统一发送可避免多个控制任务抢占同一个 DJI 组帧；所有过期命令先归零，
- *       Pitch 电机还在此完成使能确认、离线重试和 MIT 周期发送。
+ * @note 统一发送可避免多个控制任务抢占同一个 DJI 组帧；所有过期命令先归零。
  */
 static void robot_motor_tx_task(void *argument)
 {
     robot_motor_commands_t commands;
     TickType_t last_wake_tick;
     uint32_t current_tick;
-    bool pitch_enabled = false;
-    bool pitch_online;
-    uint32_t last_pitch_enable_tick = 0U;
-    robot_motor_state_t motor_feedback;
     bool test_ready;
     can_bus_t test_bus = CAN_BUS_1;
     uint16_t test_command_id = 0U;
@@ -336,12 +283,7 @@ static void robot_motor_tx_task(void *argument)
     for (;;)
     {
         robot_motor_commands_get_snapshot(&commands);
-        robot_motors_get_snapshot(&motor_feedback);
         current_tick = osKernelGetTickCount();
-        pitch_online = dm_motor_feedback_is_online(
-            &motor_feedback.gimbal.pitch,
-            current_tick,
-            pdMS_TO_TICKS(ROBOT_MOTOR_COMMAND_TIMEOUT_MS));
 
         /* 各子系统独立超时归零，某一控制任务卡死不会保留最后一次电流。 */
         if (!command_is_fresh(current_tick, commands.chassis.update_tick))
@@ -365,6 +307,15 @@ static void robot_motor_tx_task(void *argument)
         if (!command_is_fresh(current_tick, commands.gimbal.yaw_update_tick))
         {
             commands.gimbal.yaw_current = 0;
+        }
+
+        /*
+         * Pitch 是 GM6020，与 Yaw 同属"控制任务每周期必须刷新"的一组。
+         * 超时归零对云台是安全的（松开会停住），这里沿用同样的策略。
+         */
+        if (!command_is_fresh(current_tick, commands.gimbal.pitch_update_tick))
+        {
+            commands.gimbal.pitch_current = 0;
         }
 
         test_ready = dji_can_test_prepare(
@@ -400,12 +351,12 @@ static void robot_motor_tx_task(void *argument)
         /*
          * CAN1 0x200 已腾空，将由抬升组（LIFT-004）占用。
          * 当前不发送全零帧，避免白占总线带宽。
-         * CAN1 0x1FF = { 预留Pitch, 摩擦轮1, 摩擦轮2, 预留 }。
+         * CAN1 0x1FF = { Pitch(GM6020, 电压), 摩擦轮1, 摩擦轮2, 预留 }。
          */
         send_dji_group_with_test_override(
             CAN_BUS_1,
             ROBOT_DJI_COMMAND_ID_5_TO_8,
-            0,
+            commands.gimbal.pitch_current,
             commands.shooter.friction[0],
             commands.shooter.friction[1],
             0,
@@ -426,48 +377,19 @@ static void robot_motor_tx_task(void *argument)
                     test_currents[3]);
         }
 
-        /* 达妙电机需要先使能；反馈离线时按间隔重发，避免持续占满 CAN。 */
-        if (!commands.gimbal.pitch_enable_requested)
-        {
-            if (pitch_enabled && send_dm_special(false))
-            {
-                pitch_enabled = false;
-            }
-        }
-        else if (!pitch_enabled ||
-                 (!pitch_online &&
-                  ((uint32_t)(current_tick - last_pitch_enable_tick) >=
-                   pdMS_TO_TICKS(ROBOT_DM_ENABLE_RETRY_MS))))
-        {
-            if (send_dm_special(true))
-            {
-                pitch_enabled = true;
-                last_pitch_enable_tick = current_tick;
-            }
-        }
-        else
-        {
-            send_dm_mit(
-                &commands.gimbal,
-                command_is_fresh(
-                    current_tick,
-                    commands.gimbal.pitch_update_tick));
-        }
-
         vTaskDelayUntil(
             &last_wake_tick,
             pdMS_TO_TICKS(ROBOT_MOTOR_TX_PERIOD_MS));
     }
 }
 
-/** 清空电机命令缓存和测试状态，并默认请求 Pitch 电机使能。 */
+/** 清空电机命令缓存和测试状态。 */
 void robot_motor_commands_init(void)
 {
     taskENTER_CRITICAL();
     (void)memset(&command_cache, 0, sizeof(command_cache));
     (void)memset(&g_dji_can_test_status, 0, sizeof(g_dji_can_test_status));
     g_dji_can_test_command.enabled = false;
-    command_cache.gimbal.pitch_enable_requested = true;
     taskEXIT_CRITICAL();
 }
 
@@ -526,31 +448,19 @@ void robot_gimbal_set_yaw_current(int16_t current)
     taskEXIT_CRITICAL();
 }
 
-/** 原子更新 Pitch 电机的完整 MIT 控制参数及其时间戳。 */
-void robot_gimbal_set_pitch_mit(
-    float position,
-    float velocity,
-    float kp,
-    float kd,
-    float torque)
+/**
+ * @brief 原子更新 Pitch 电机电流（GM6020 走 0x1FF，实际为电压量纲）。
+ * @note 限幅用 ROBOT_6020_CURRENT_LIMIT(±30000)，与 Yaw 同量纲，
+ *       不可误用 C620/C610 的 ±16384/±10000。
+ */
+void robot_gimbal_set_pitch_current(int16_t current)
 {
     const uint32_t tick = osKernelGetTickCount();
 
     taskENTER_CRITICAL();
-    command_cache.gimbal.pitch_position = position;
-    command_cache.gimbal.pitch_velocity = velocity;
-    command_cache.gimbal.pitch_kp = kp;
-    command_cache.gimbal.pitch_kd = kd;
-    command_cache.gimbal.pitch_torque = torque;
+    command_cache.gimbal.pitch_current =
+        clamp_current(current, ROBOT_6020_CURRENT_LIMIT);
     command_cache.gimbal.pitch_update_tick = tick;
-    taskEXIT_CRITICAL();
-}
-
-/** 请求统一发送任务使能或失能 Pitch 电机。 */
-void robot_gimbal_request_pitch_enable(bool enable)
-{
-    taskENTER_CRITICAL();
-    command_cache.gimbal.pitch_enable_requested = enable;
     taskEXIT_CRITICAL();
 }
 

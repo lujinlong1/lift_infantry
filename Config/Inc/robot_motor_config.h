@@ -21,9 +21,8 @@
 #define ROBOT_FEED_MOTOR_COUNT             1U
 
 /* CAN1: pitch, friction wheels, and (reserved) lift screws. */
-#define ROBOT_DM_PITCH_TX_ID              0x001U
-#define ROBOT_DM_PITCH_RX_ID              0x011U
-#define ROBOT_DM_PITCH_MOTOR_ID           0x01U
+/* Pitch 改为 GM6020，走标准 DJI 帧：反馈 0x205，命令 0x1FF 槽 1（电压量纲）。 */
+#define ROBOT_PITCH_MOTOR_ID               0x205U
 
 #define ROBOT_FRICTION_MOTOR_1_ID         0x206U
 #define ROBOT_FRICTION_MOTOR_2_ID         0x207U
@@ -41,7 +40,6 @@
 
 #define ROBOT_MOTOR_TX_PERIOD_MS           2U
 #define ROBOT_MOTOR_COMMAND_TIMEOUT_MS     100U
-#define ROBOT_DM_ENABLE_RETRY_MS            100U
 #define ROBOT_DJI_TEST_ZERO_HOLD_MS         500U
 
 #define ROBOT_3508_CURRENT_LIMIT           16384

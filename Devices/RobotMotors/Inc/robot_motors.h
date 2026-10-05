@@ -3,7 +3,6 @@
 
 #include "can_rx_service.h"
 #include "dji_motor.h"
-#include "dm_motor.h"
 #include "robot_motor_config.h"
 
 #include <stdbool.h>
@@ -15,7 +14,7 @@ typedef struct
 
 typedef struct
 {
-    dm_motor_feedback_t pitch;
+    dji_motor_feedback_t pitch;
     dji_motor_feedback_t yaw;
 } gimbal_motors_t;
 

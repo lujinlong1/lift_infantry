@@ -1,8 +1,6 @@
 #include "pitch_test_task.h"
 
-#include "can_rx_service.h"
 #include "cmsis_os2.h"
-#include "dm_motor.h"
 #include "FreeRTOS.h"
 #include "robot_motor_commands.h"
 #include "robot_motors.h"
@@ -13,9 +11,12 @@
 #define PITCH_TEST_DEFAULT_DURATION_MS 2000U
 #define PITCH_TEST_MAX_DURATION_MS     5000U
 #define PITCH_TEST_ONLINE_TIMEOUT_MS   100U
+/* 点动电压上限：GM6020 满量程 ±30000，诊断只允许用其中一小部分。 */
+#define PITCH_TEST_MAX_CURRENT         3000
 
 pitch_test_command_t g_pitch_test_command = {
     .enabled = false,
+    .test_current = 500,
     .duration_ms = PITCH_TEST_DEFAULT_DURATION_MS
 };
 
@@ -25,7 +26,7 @@ static osThreadId_t pitch_test_task_handle;
 static StaticTask_t pitch_test_task_control;
 static StackType_t pitch_test_task_stack[PITCH_TEST_TASK_STACK_WORDS];
 
-/** 修正 Pitch 测试持续时间，防止电机长期保持使能。 */
+/** 修正 Pitch 测试持续时间，防止电机长期保持通电。 */
 static uint32_t pitch_test_limit_duration(uint32_t duration_ms)
 {
     if (duration_ms == 0U)
@@ -39,13 +40,21 @@ static uint32_t pitch_test_limit_duration(uint32_t duration_ms)
     return duration_ms;
 }
 
-/** 写入零刚度、零阻尼、零力矩的 MIT 无力命令。 */
-static void pitch_test_set_zero_output(void)
+/** 把诊断电压限制在安全范围内。 */
+static int16_t pitch_test_limit_current(int16_t test_current)
 {
-    robot_gimbal_set_pitch_mit(0.0F, 0.0F, 0.0F, 0.0F, 0.0F);
+    if (test_current > PITCH_TEST_MAX_CURRENT)
+    {
+        return PITCH_TEST_MAX_CURRENT;
+    }
+    if (test_current < -PITCH_TEST_MAX_CURRENT)
+    {
+        return -PITCH_TEST_MAX_CURRENT;
+    }
+    return test_current;
 }
 
-/** 汇总 Pitch 原始报文计数、解码反馈和在线状态。 */
+/** 汇总 Pitch 的 DJI 解码反馈和在线状态。 */
 static void pitch_test_update_status(void)
 {
     robot_motor_state_t motors;
@@ -54,27 +63,20 @@ static void pitch_test_update_status(void)
     robot_motors_get_snapshot(&motors);
     current_tick = osKernelGetTickCount();
 
-    g_pitch_test_status.raw_id_001_count =
-        g_can_rx_debug.id_001_count[0];
-    g_pitch_test_status.raw_id_011_count =
-        g_can_rx_debug.id_011_count[0];
     g_pitch_test_status.feedback_update_count =
         motors.gimbal.pitch.update_count;
-    g_pitch_test_status.position = motors.gimbal.pitch.position;
-    g_pitch_test_status.velocity = motors.gimbal.pitch.velocity;
-    g_pitch_test_status.torque = motors.gimbal.pitch.torque;
-    g_pitch_test_status.error_code = motors.gimbal.pitch.error_code;
-    g_pitch_test_status.mos_temperature =
-        motors.gimbal.pitch.mos_temperature;
-    g_pitch_test_status.rotor_temperature =
-        motors.gimbal.pitch.rotor_temperature;
-    g_pitch_test_status.online = dm_motor_feedback_is_online(
+    g_pitch_test_status.ecd = motors.gimbal.pitch.ecd;
+    g_pitch_test_status.total_ecd = motors.gimbal.pitch.total_ecd;
+    g_pitch_test_status.speed_rpm = motors.gimbal.pitch.speed_rpm;
+    g_pitch_test_status.given_current = motors.gimbal.pitch.given_current;
+    g_pitch_test_status.temperature = motors.gimbal.pitch.temperature;
+    g_pitch_test_status.online = dji_motor_feedback_is_online(
         &motors.gimbal.pitch,
         current_tick,
         pdMS_TO_TICKS(PITCH_TEST_ONLINE_TIMEOUT_MS));
 }
 
-/** 在限定时间内测试 Pitch 使能和反馈链路，结束后主动失能。 */
+/** 在限定时间内按恒定电压点动 Pitch，结束后立刻归零。 */
 static void pitch_test_task(void *argument)
 {
     TickType_t last_wake_tick;
@@ -93,8 +95,6 @@ static void pitch_test_task(void *argument)
             start_tick = osKernelGetTickCount();
             duration_ticks = pdMS_TO_TICKS(pitch_test_limit_duration(
                 g_pitch_test_command.duration_ms));
-            pitch_test_set_zero_output();
-            robot_gimbal_request_pitch_enable(true);
             g_pitch_test_status.running = true;
             was_enabled = true;
         }
@@ -104,21 +104,17 @@ static void pitch_test_task(void *argument)
             elapsed_ticks = (uint32_t)(osKernelGetTickCount() - start_tick);
             g_pitch_test_status.elapsed_ms =
                 elapsed_ticks * portTICK_PERIOD_MS;
-            pitch_test_set_zero_output();
+            robot_gimbal_set_pitch_current(
+                pitch_test_limit_current(g_pitch_test_command.test_current));
 
             if (!g_pitch_test_command.enabled ||
                 (elapsed_ticks >= duration_ticks))
             {
-                robot_gimbal_request_pitch_enable(false);
-                pitch_test_set_zero_output();
+                robot_gimbal_set_pitch_current(0);
                 g_pitch_test_command.enabled = false;
                 g_pitch_test_status.running = false;
                 was_enabled = false;
             }
-        }
-        else
-        {
-            robot_gimbal_request_pitch_enable(false);
         }
 
         pitch_test_update_status();
