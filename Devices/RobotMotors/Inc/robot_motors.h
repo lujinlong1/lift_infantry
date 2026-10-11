@@ -14,6 +14,11 @@ typedef struct
 
 typedef struct
 {
+    dji_motor_feedback_t motor[ROBOT_LIFT_MOTOR_COUNT];
+} lift_motors_t;
+
+typedef struct
+{
     dji_motor_feedback_t pitch;
     dji_motor_feedback_t yaw;
 } gimbal_motors_t;
@@ -27,6 +32,7 @@ typedef struct
 typedef struct
 {
     chassis_motors_t chassis;
+    lift_motors_t lift;
     gimbal_motors_t gimbal;
     shooter_motors_t shooter;
 } robot_motor_state_t;
@@ -39,4 +45,3 @@ bool robot_motors_process_frame(const can_rx_frame_t *frame);
 void robot_motors_get_snapshot(robot_motor_state_t *snapshot);
 
 #endif
-

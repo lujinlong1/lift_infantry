@@ -6,6 +6,7 @@
 #include "dbus_remote.h"
 #include "FreeRTOS.h"
 #include "pitch_control.h"
+#include "remote_lift.h"
 #include "shooter_control.h"
 #include "task.h"
 #include "yaw_control.h"
@@ -694,6 +695,31 @@ static void remote_task(void *argument)
                     fire_was_active = false;
                 }
             }
+
+            /*
+             * 抬升命令（见 remote_lift.h 的操作手动作表）：
+             *   右拨杆上/中档 + 左摇杆上下 = 抬升/下降（增量绝对高度目标）
+             *   左拨杆下档保持 = 清零点；再中档保持 = 请求找零
+             * 未找零时本模块不发任何运动命令，只报 need_homing。
+             */
+            (void)remote_lift_map(
+                remote.channel,
+                g_remote_mapping_status.online,
+                remote.switch_right != DBUS_SWITCH_DOWN,
+                (remote_lift_left_t)remote.switch_left,
+                current_tick);
+            g_remote_mapping_status.lift_enabled =
+                g_remote_lift_status.enabled;
+            g_remote_mapping_status.lift_need_homing =
+                g_remote_lift_status.need_homing;
+            g_remote_mapping_status.lift_homing_armed =
+                g_remote_lift_status.homing_armed;
+            g_remote_mapping_status.lift_target_height_ecd =
+                g_remote_lift_status.target_height_ecd;
+            g_remote_mapping_status.lift_refresh_count =
+                g_remote_lift_status.refresh_count;
+            g_remote_mapping_status.lift_block_count =
+                g_remote_lift_status.block_count;
         }
 
         g_remote_mapping_status.update_count++;
@@ -743,6 +769,8 @@ void remote_mapping_init(void)
     remote_pitch_powerdown_active = false;
     remote_pitch_powerdown_complete = false;
     remote_pitch_powerdown_start_tick = 0U;
+    /* 抬升遥控映射的默认值由本模块自己持有，避免和上面的 memset 互相覆盖。 */
+    remote_lift_init();
 }
 
 /** @brief 使用静态内存创建遥控映射任务。 */

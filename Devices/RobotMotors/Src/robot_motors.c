@@ -47,6 +47,16 @@ bool robot_motors_process_frame(const can_rx_frame_t *frame)
     {
         switch (frame->std_id)
         {
+            case ROBOT_LIFT_MOTOR_1_ID:
+            case ROBOT_LIFT_MOTOR_2_ID:
+            case ROBOT_LIFT_MOTOR_3_ID:
+            case ROBOT_LIFT_MOTOR_4_ID:
+                return robot_motors_decode_dji(
+                    &g_robot_motors.lift.motor[
+                        frame->std_id - ROBOT_LIFT_MOTOR_1_ID],
+                    frame,
+                    current_tick);
+
             case ROBOT_PITCH_MOTOR_ID:
                 return robot_motors_decode_dji(
                     &g_robot_motors.gimbal.pitch,

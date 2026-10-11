@@ -5,6 +5,7 @@
 #include "chassis_control.h"
 #include "friction_control.h"
 #include "feed_control.h"
+#include "lift_control_task.h"
 #include "robot_motor_commands.h"
 #include "robot_motors.h"
 #include "shooter_control.h"
@@ -33,6 +34,11 @@ bool system_init(void)
     shooter_control_init();
     yaw_control_init();
     pitch_control_init();
+    /*
+     * 抬升：先建纯逻辑链（标定参数 + 派生增益 + 空配置），再建遥控映射。
+     * 这里【只初始化，不使能】：没有遥控命令时不会有任何电流。
+     */
+    lift_control_task_init();
     remote_mapping_init();
     telemetry_init();
     runtime_monitor_init();

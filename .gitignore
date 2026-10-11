@@ -19,6 +19,9 @@
 /MDK-ARM/lift_infantry/
 /MDK-ARM/*_backup_*/
 /MDK-ARM/JLinkLog.txt
+# Keil per-user project backups and the generated Event Recorder stub
+/MDK-ARM/*.bak
+/MDK-ARM/EventRecorderStub.scvd
 
 # Local recovery copies
 /.codex_backup/

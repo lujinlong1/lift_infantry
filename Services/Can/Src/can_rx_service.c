@@ -8,7 +8,20 @@
 
 #include <string.h>
 
-#define CAN_RX_QUEUE_LENGTH      32U
+/*
+ * 接收队列深度。
+ *
+ * 为什么从 32 提到 128：4 个抬升电机 + Pitch + 2 个摩擦轮都在发反馈，
+ * 按每个 1 kHz 算，总帧率约 4~7 kHz；32 帧只够缓冲 8 ms。
+ * 一旦接收任务被短暂抢占超过 8 ms，队列就满、帧被丢 —— 实测 21 万帧里
+ * 丢了 35 帧（0.017%）。
+ *
+ * 丢帧本身不会致命（算过：即使 35 帧是一次突发，缺口内最快位移也只有
+ * 几百计数，远小于"半圈假设"的 4096 边界），但它是**不该出现的隐患**：
+ * 一旦某次突发更长，"多圈展开"就可能猜错一整圈，而位置会永久偏掉且不自愈。
+ * 128 帧 ≈ 32 ms 缓冲，成本只有约 2 KB RAM。
+ */
+#define CAN_RX_QUEUE_LENGTH      128U
 #define CAN_RX_TASK_STACK_WORDS  512U
 
 static osMessageQueueId_t can_rx_queue;
@@ -129,6 +142,7 @@ bool can_rx_service_push_from_isr(const can_rx_frame_t *frame)
     if ((frame == NULL) || (can_rx_queue == NULL))
     {
         dropped_count++;
+        g_can_rx_debug.dropped_count = dropped_count;
         return false;
     }
 
@@ -139,10 +153,12 @@ bool can_rx_service_push_from_isr(const can_rx_frame_t *frame)
             0U) != osOK)
     {
         dropped_count++;
+        g_can_rx_debug.dropped_count = dropped_count;
         return false;
     }
 
     received_count++;
+    g_can_rx_debug.received_count = received_count;
     return true;
 }
 

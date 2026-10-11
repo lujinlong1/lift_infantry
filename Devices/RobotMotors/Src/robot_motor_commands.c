@@ -292,6 +292,12 @@ static void robot_motor_tx_task(void *argument)
                          sizeof(commands.chassis.wheel));
         }
 
+        if (!command_is_fresh(current_tick, commands.lift.update_tick))
+        {
+            (void)memset(commands.lift.motor, 0,
+                         sizeof(commands.lift.motor));
+        }
+
         if (!command_is_fresh(
                 current_tick, commands.shooter.friction_update_tick))
         {
@@ -337,6 +343,18 @@ static void robot_motor_tx_task(void *argument)
             test_currents);
 
         send_dji_group_with_test_override(
+            CAN_BUS_1,
+            ROBOT_DJI_COMMAND_ID_1_TO_4,
+            commands.lift.motor[0],
+            commands.lift.motor[1],
+            commands.lift.motor[2],
+            commands.lift.motor[3],
+            test_ready,
+            test_bus,
+            test_command_id,
+            test_currents);
+
+        send_dji_group_with_test_override(
             CAN_BUS_2,
             ROBOT_DJI_COMMAND_ID_5_TO_8,
             0,
@@ -348,11 +366,7 @@ static void robot_motor_tx_task(void *argument)
             test_command_id,
             test_currents);
 
-        /*
-         * CAN1 0x200 已腾空，将由抬升组（LIFT-004）占用。
-         * 当前不发送全零帧，避免白占总线带宽。
-         * CAN1 0x1FF = { Pitch(GM6020, 电压), 摩擦轮1, 摩擦轮2, 预留 }。
-         */
+        /* CAN1 0x1FF = { Pitch(GM6020, 电压), 摩擦轮1, 摩擦轮2, 预留 }。 */
         send_dji_group_with_test_override(
             CAN_BUS_1,
             ROBOT_DJI_COMMAND_ID_5_TO_8,
@@ -433,6 +447,28 @@ void robot_chassis_set_currents(
             clamp_current(currents[index], ROBOT_3508_CURRENT_LIMIT);
     }
     command_cache.chassis.update_tick = tick;
+    taskEXIT_CRITICAL();
+}
+
+/** 限幅并原子更新四个抬升电机电流及其时间戳。 */
+void robot_lift_set_currents(
+    int16_t motor1,
+    int16_t motor2,
+    int16_t motor3,
+    int16_t motor4)
+{
+    const int16_t currents[ROBOT_LIFT_MOTOR_COUNT] = {
+        motor1, motor2, motor3, motor4};
+    uint32_t index;
+    const uint32_t tick = osKernelGetTickCount();
+
+    taskENTER_CRITICAL();
+    for (index = 0U; index < ROBOT_LIFT_MOTOR_COUNT; index++)
+    {
+        command_cache.lift.motor[index] =
+            clamp_current(currents[index], ROBOT_3508_CURRENT_LIMIT);
+    }
+    command_cache.lift.update_tick = tick;
     taskEXIT_CRITICAL();
 }
 

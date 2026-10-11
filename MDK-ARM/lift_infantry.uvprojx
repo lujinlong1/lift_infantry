@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F407xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Application/Inc;../Bsp/Inc;../Services/Can/Inc;../Services/AutoAim/Inc;../Devices/DjiMotor/Inc;../Config/Inc;../Devices/RobotMotors/Inc;../Diagnostics/MotorTest/Inc;../Diagnostics/Telemetry/Inc;../Diagnostics/RuntimeMonitor/Inc;../Algorithms/Pid/Inc;../Application/Chassis/Inc;../Application/Shooter/Inc;../Application/Gimbal/Inc;../Services/Remote/Inc;../Application/Remote/Inc;../Middlewares/ST/STM32_USB_Device_Library/Core/Inc;../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc</IncludePath>
+              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Application/Inc;../Bsp/Inc;../Services/Can/Inc;../Services/AutoAim/Inc;../Devices/DjiMotor/Inc;../Config/Inc;../Devices/RobotMotors/Inc;../Diagnostics/MotorTest/Inc;../Diagnostics/Telemetry/Inc;../Diagnostics/RuntimeMonitor/Inc;../Algorithms/Pid/Inc;../Application/Chassis/Inc;../Application/Shooter/Inc;../Application/Gimbal/Inc;../Application/Lift/Inc;../Services/Remote/Inc;../Application/Remote/Inc;../Middlewares/ST/STM32_USB_Device_Library/Core/Inc;../Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Inc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -359,7 +359,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;..\Application\Inc;..\Bsp\Inc;..\Services\Can\Inc;..\Devices\DjiMotor\Inc;..\Config\Inc;..\Devices\RobotMotors\Inc;..\Diagnostics\MotorTest\Inc;..\Diagnostics\RuntimeMonitor\Inc;..\Algorithms\Pid\Inc;..\Application\Chassis\Inc;..\Application\Shooter\Inc;..\Application\Gimbal\Inc;..\Services\Remote\Inc;..\Application\Remote\Inc</IncludePath>
+              <IncludePath>../Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;..\Application\Inc;..\Bsp\Inc;..\Services\Can\Inc;..\Devices\DjiMotor\Inc;..\Config\Inc;..\Devices\RobotMotors\Inc;..\Diagnostics\MotorTest\Inc;..\Diagnostics\RuntimeMonitor\Inc;..\Algorithms\Pid\Inc;..\Application\Chassis\Inc;..\Application\Shooter\Inc;..\Application\Gimbal\Inc;..\Application\Lift\Inc;..\Services\Remote\Inc;..\Application\Remote\Inc</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -1172,6 +1172,16 @@
               <FileType>5</FileType>
               <FilePath>..\Diagnostics\MotorTest\Inc\pitch_test_task.h</FilePath>
             </File>
+            <File>
+              <FileName>lift_jog_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Diagnostics\MotorTest\Src\lift_jog_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_jog_task.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Diagnostics\MotorTest\Inc\lift_jog_task.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -1275,6 +1285,91 @@
           </Files>
         </Group>
         <Group>
+          <GroupName>Application/Lift</GroupName>
+          <Files>
+            <File>
+              <FileName>lift_top.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_top.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_top.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_top.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_control.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_control.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_sync.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_sync.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_sync.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_sync.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_guard.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_guard.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_guard.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_guard.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_homing.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_homing.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_homing.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_homing.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_seq.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_seq.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_seq.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_seq.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_geometry.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_geometry.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_geometry.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_geometry.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_control_task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_control_task.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_control_task.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_control_task.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
           <GroupName>Services/Remote</GroupName>
           <Files>
             <File>
@@ -1301,6 +1396,16 @@
               <FileName>remote_control_task.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Application\Remote\Inc\remote_control_task.h</FilePath>
+            </File>
+            <File>
+              <FileName>remote_lift.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Remote\Src\remote_lift.c</FilePath>
+            </File>
+            <File>
+              <FileName>remote_lift.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Remote\Inc\remote_lift.h</FilePath>
             </File>
           </Files>
         </Group>

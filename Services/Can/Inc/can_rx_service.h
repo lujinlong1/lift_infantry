@@ -27,6 +27,21 @@ typedef struct
     volatile uint32_t id_001_count[2];
     volatile uint32_t id_011_count[2];
     volatile uint32_t dji_id_count[2][8];
+    /*
+     * 队列层计数（与 total_count 的区别很重要）：
+     *   received_count  成功进入接收队列的帧数
+     *   dropped_count   因队列未就绪/已满而【丢弃】的帧数
+     *
+     * ⚠️ dropped_count 是最需要盯的一个：帧一丢，编码器多圈展开的
+     *    "一帧不超过半圈"假设就可能被破坏，而位置会【永久偏一整圈且不自愈】。
+     *    正常应恒为 0；一旦开始涨，先查接收任务是否被长时间抢占、
+     *    或队列深度是否不够。
+     *
+     * 原来只有 can_rx_service_get_dropped_count() 这个函数接口，
+     * 函数返回值在 Keil 的 Watch 窗口里看不到，所以镜像一份到这里。
+     */
+    volatile uint32_t received_count;
+    volatile uint32_t dropped_count;
 } can_rx_debug_t;
 
 extern can_rx_debug_t g_can_rx_debug;

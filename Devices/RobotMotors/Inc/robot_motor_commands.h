@@ -14,6 +14,12 @@ typedef struct
 
 typedef struct
 {
+    int16_t motor[ROBOT_LIFT_MOTOR_COUNT];
+    uint32_t update_tick;
+} lift_motor_commands_t;
+
+typedef struct
+{
     int16_t pitch_current;
     uint32_t pitch_update_tick;
     int16_t yaw_current;
@@ -31,6 +37,7 @@ typedef struct
 typedef struct
 {
     chassis_motor_commands_t chassis;
+    lift_motor_commands_t lift;
     gimbal_motor_commands_t gimbal;
     shooter_motor_commands_t shooter;
 } robot_motor_commands_t;
@@ -68,6 +75,12 @@ void robot_chassis_set_currents(
     int16_t wheel2,
     int16_t wheel3,
     int16_t wheel4);
+
+void robot_lift_set_currents(
+    int16_t motor1,
+    int16_t motor2,
+    int16_t motor3,
+    int16_t motor4);
 
 void robot_gimbal_set_yaw_current(int16_t current);
 

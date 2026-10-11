@@ -4,6 +4,8 @@
 #include "chassis_control.h"
 #include "friction_control.h"
 #include "feed_control.h"
+#include "lift_control_task.h"
+#include "lift_jog_task.h"
 #include "robot_motor_commands.h"
 #include "shooter_control.h"
 #include "yaw_control.h"
@@ -37,6 +39,15 @@ bool app_tasks_create(void)
     if (!yaw_control_task_create())
         return false;
     if (!pitch_control_task_create())
+        return false;
+    /* 抬升控制任务：必须有，否则抬升命令没有执行者，机构不会被驱动。 */
+    if (!lift_control_task_create())
+        return false;
+    /*
+     * 抬升诊断点动（P1/P2/P3 标定用）。它默认不可动：axis 未指定、enabled
+     * 为 false，只有调试器里显式写好参数并置 enabled 才会有电流。
+     */
+    if (!lift_jog_task_create())
         return false;
     if (!remote_mapping_task_create())
         return false;

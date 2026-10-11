@@ -51,6 +51,13 @@ typedef struct
     volatile float pitch_raw_rate_deg_s;
     volatile float pitch_filtered_rate_deg_s;
     volatile float pitch_ramped_rate_deg_s;
+    /* 抬升遥控状态（来源见 remote_lift.h 的操作手动作表）。 */
+    volatile bool lift_enabled;
+    volatile bool lift_need_homing;
+    volatile bool lift_homing_armed;
+    volatile int32_t lift_target_height_ecd;
+    volatile uint32_t lift_refresh_count;
+    volatile uint32_t lift_block_count;
     volatile uint32_t update_count;
     volatile uint32_t failsafe_count;
 } remote_mapping_status_t;

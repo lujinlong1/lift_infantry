@@ -6,7 +6,7 @@
  * 讨论池/电机映射表.md，改 ID 时先改该表再改本文件。
  *
  * CAN1 组帧：
- *   0x200 = { 空闲, 空闲, 空闲, 空闲 }         抬升组预留（LIFT-004）
+ *   0x200 = { 抬升1, 抬升2, 抬升3, 抬升4 }     四个 M3508 抬升组
  *   0x1FF = { 空闲, 摩擦轮1, 摩擦轮2, 空闲 }   槽1 预留 Pitch(GM6020)
  * CAN2 组帧：
  *   0x200 = { 底盘1, 底盘2, 底盘3, 底盘4 }
@@ -20,7 +20,13 @@
 #define ROBOT_FRICTION_MOTOR_COUNT         2U
 #define ROBOT_FEED_MOTOR_COUNT             1U
 
-/* CAN1: pitch, friction wheels, and (reserved) lift screws. */
+/* CAN1: four lift motors, pitch, and friction wheels. */
+#define ROBOT_LIFT_MOTOR_COUNT            4U
+#define ROBOT_LIFT_MOTOR_1_ID             0x201U
+#define ROBOT_LIFT_MOTOR_2_ID             0x202U
+#define ROBOT_LIFT_MOTOR_3_ID             0x203U
+#define ROBOT_LIFT_MOTOR_4_ID             0x204U
+
 /* Pitch 改为 GM6020，走标准 DJI 帧：反馈 0x205，命令 0x1FF 槽 1（电压量纲）。 */
 #define ROBOT_PITCH_MOTOR_ID               0x205U
 
