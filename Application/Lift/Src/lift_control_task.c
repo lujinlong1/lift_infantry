@@ -80,12 +80,15 @@
  *    闭环实际工作区在 2000~4000 电流（受 `LIFT_MEASURED_CURRENT_LIMIT`
  *    与重力前馈约束），取 0.5 偏保守的一侧更安全。
  *
- * 上板后核对：`g_lift_control_status.speed_loop_kp` 应 ≈ 120，
- * 离 `speed_loop_kp_max`(≈360) 有 3 倍余量。
+ * 上板后核对：`g_lift_control_status.speed_loop_kp` 应 ≈ 30，
+ * 离 `speed_loop_kp_max`(≈90) 有 3 倍余量。
+ * ⚠️ 2026-10-11：这两个数以前是 120 / 360，因为派生时**漏乘了模态域的 4 倍**
+ *    （模态被控对象增益是 4K，不是 K），实际回路增益是目标值的 4 倍。
+ *    详见 lift_derive_gains() 里的说明。
  */
 #define LIFT_ACTUATOR_GAIN_ECD_S_PER_CURRENT  0.5F
 
-/* 内环回路增益目标 GH = Kp·K·h，稳定条件 GH < 2；取 0.30 留 6 倍余量。 */
+/* 内环回路增益目标 GH = Kp·(4K)·h，稳定条件 GH < 2；取 0.30 留 6 倍余量。 */
 #define LIFT_SPEED_LOOP_GAIN_TARGET         0.30F
 /* 外环带宽取内环的 1/3：再快就会和速度环抢相位。 */
 #define LIFT_POSITION_LOOP_BANDWIDTH_RATIO  0.33F
@@ -334,9 +337,25 @@ static void lift_derive_gains(lift_control_debug_t *debug)
          * 速度环：控制量 = Kp × 速度误差，被控对象是"电流 → ecd/s"的增益 K。
          * 回路增益 GH = Kp·K·h（离散），稳定条件 GH < 2，取 0.30 留余量。
          * 极性由 axis_direction 在 lift_top 里统一处理，这里取正。
+         *
+         * ⚠️⚠️ 2026-10-11 修正：模态量的被控对象增益是 **4K**，不是 K。
+         *
+         *   链路：模态控制量 effort → distribute 给每轴电流 = effort（高度模态
+         *   的权重全是 +1）→ 每轴速度 = K × effort → 模态速度 = Σ(四轴速度)
+         *   = **4·K·effort**。
+         *
+         *   所以模态域的回路增益是 GH = Kp ·(4K)· h。少乘这个 4，实际 GH 就是
+         *   目标值的 4 倍：0.30 → 1.20（离稳定边界 2 只剩 40% 余量），
+         *   表现为"能收敛但很欠阻尼、目标附近大幅摆动"。
+         *   这是本项目第 N 次栽在同一个 4 倍上（模态量 = 四轴之和，不除 4）。
+         *
+         *   注意速度环的 **限幅量纲不变**：effort 与单轴电流 1:1，
+         *   所以 speed_output_limit 仍然是电流。
          */
-        speed_kp = LIFT_SPEED_LOOP_GAIN_TARGET / (gain * h);
-        speed_kp_max = LIFT_SPEED_LOOP_KP_MARGIN / (gain * h);
+        const float modal_gain = gain * (float)LIFT_CHANNEL_COUNT;
+
+        speed_kp = LIFT_SPEED_LOOP_GAIN_TARGET / (modal_gain * h);
+        speed_kp_max = LIFT_SPEED_LOOP_KP_MARGIN / (modal_gain * h);
     }
     if (speed_kp > speed_kp_max)
     {
