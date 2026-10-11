@@ -45,6 +45,16 @@
  *   左拨杆中档（保持）        = 请求找零
  *   左拨杆上档                = 云台/发射（原有功能），抬升保持高度
  *
+ * ⚠️ 2026-10-11：**本模块默认关闭**（`g_remote_lift_debug.enabled = false`）。
+ *    抬升目前只在 debug 里调（Watch 直接写 g_lift_task_command，
+ *    或用台架模块 lift_jog_task）。要在整车联调前处理的两件事：
+ *      ① 摇杆通道还没有着落：stick_channel 默认 1，而 channel[1] 是【右摇杆
+ *         竖直 = Pitch 速度输入】（见 remote_control_task.c 的 remote_set_gimbal），
+ *         channel[2]/[3] 被底盘占用、channel[0] 是 Yaw、channel[4] 是发射拨盘
+ *         —— 现在没有空闲的模拟通道，必须先定"用哪个操作件抬升"。
+ *      ② 上面的三段拨杆时序（找零/清零点）从来没在实机上跑通过，
+ *         打开之前必须先在台架上把找零两步走一遍。
+ *
  * 找零会让机构一路下行到底部堵转，必须由人明确要求，且必须在"清零点"之后
  * 才允许——这就是 ADR-007 的两步重新找零。因此**每次上电后（以及每次想让
  * 已找零结果失效时）都必须先在下档保持够久，再切到中档保持够久**，本模块
@@ -52,15 +62,27 @@
  * 之所以用"保持"而不是"点一下"，是为了让一次误碰不可能启动找零。
  */
 
+#include "dbus_remote.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 左拨杆三段（与 dbus_remote.h 的 DBUS_SWITCH_* 数值一致，这里给语义名）。 */
+/* 左拨杆三段。
+ *
+ * ⚠️ 2026-10-11 修正：这里以前写成 DOWN=0 / MID=1 / UP=2，而 dbus_remote.h 的
+ *    真实原始值是 UP=1 / DOWN=2 / MID=3（0 表示帧没对齐，dbus_remote.c 直接
+ *    丢弃该帧）。调用点是 (remote_lift_left_t)remote.switch_left 直接强转，
+ *    于是：物理上档(1) 被当成"中档"分支 → 撤销使能；下档(2)/中档(3) 落进
+ *    "上档"分支 → 反而正常操作；而唯一会置 homing_armed 的分支要求 left==0，
+ *    **永远进不去** ⇒ 清零点、找零、清故障三个功能全部不可达，homed 恒 false。
+ *
+ *    现在直接取 DBUS_SWITCH_* 的值，类型与原始值不再可能对不上。
+ */
 typedef enum
 {
-    REMOTE_LIFT_LEFT_DOWN = 0,   /* 抬升作废 + 清零点 / 清故障 */
-    REMOTE_LIFT_LEFT_MID,        /* 请求找零（需先清零点） */
-    REMOTE_LIFT_LEFT_UP          /* 正常操作（云台/发射），抬升保持高度 */
+    REMOTE_LIFT_LEFT_UP = DBUS_SWITCH_UP,       /* 1 正常操作（云台/发射） */
+    REMOTE_LIFT_LEFT_DOWN = DBUS_SWITCH_DOWN,   /* 2 抬升作废 + 清零点 / 清故障 */
+    REMOTE_LIFT_LEFT_MID = DBUS_SWITCH_MID      /* 3 请求找零（需先清零点） */
 } remote_lift_left_t;
 
 typedef struct
@@ -68,9 +90,19 @@ typedef struct
     volatile bool enabled;
 
     /* 摇杆映射 */
-    volatile int16_t stick_channel;     /* DBUS channel[0..4]，默认 1（左摇杆上下） */
+    /*
+     * ⚠️ channel[0..4] 的占用情况（2026-10-11 核对，别照着旧注释填）：
+     *   0 = 右摇杆水平 → Yaw 速度
+     *   1 = 右摇杆竖直 → 【Pitch 速度】   ← 本模块默认也指向它，会互相打架
+     *   2 = 左摇杆水平 → 底盘横移
+     *   3 = 左摇杆竖直 → 底盘前后
+     *   4 = 发射拨盘
+     * 所以"用哪个操作件抬升"是个**还没定**的设计问题，见文件头说明。
+     */
+    volatile int16_t stick_channel;     /* DBUS channel[0..4] */
     volatile int16_t stick_deadband;
-    volatile float   stick_scale;       /* (计数/周期) 每 摇杆单位 */
+    /* 摇杆量 → 每周期目标增量（【模态高度】计数；满杆 = 660 × 本值）。 */
+    volatile float   stick_scale;
     volatile float   stick_filter_tau_s;
     volatile int8_t  stick_direction;   /* +1 / -1 */
 

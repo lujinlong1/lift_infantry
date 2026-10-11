@@ -107,6 +107,20 @@ void lift_guard_init(lift_guard_t *self, const lift_guard_config_t *config)
         self->config.descent_current[ch] =
             guard_clamp_i16(self->config.descent_current[ch], self->config.current_limit);
 
+        /* 停放点必须落在行程区间内，否则缓降会一直走不到目标。 */
+        if (self->config.descent_target_ecd[ch] <
+            self->config.position_min_ecd[ch])
+        {
+            self->config.descent_target_ecd[ch] =
+                self->config.position_min_ecd[ch];
+        }
+        if (self->config.descent_target_ecd[ch] >
+            self->config.position_max_ecd[ch])
+        {
+            self->config.descent_target_ecd[ch] =
+                self->config.position_max_ecd[ch];
+        }
+
         /* 限位上下界写反时自动纠正，避免把机构锁死。 */
         if (self->config.position_min_ecd[ch] > self->config.position_max_ecd[ch])
         {
@@ -184,7 +198,8 @@ void lift_guard_update(
 
         for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
         {
-            const int32_t target = self->config.position_min_ecd[ch];
+            /* 目标是"停放点"，不是行程下限：下限可能配在机械死点之下。 */
+            const int32_t target = self->config.descent_target_ecd[ch];
             const int move =
                 guard_move_sign(&self->config, ch, self->config.descent_current[ch]);
             bool reached;

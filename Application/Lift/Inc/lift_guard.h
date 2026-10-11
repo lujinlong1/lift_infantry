@@ -56,6 +56,17 @@ typedef struct
     int8_t  direction[LIFT_CHANNEL_COUNT];
     /* 缓降电流（带符号）。方向由 direction 与符号共同决定，应指向 position_min。 */
     int16_t descent_current[LIFT_CHANNEL_COUNT];
+    /*
+     * 缓降的停止位置（已找零坐标，单轴计数）。
+     *
+     * ⚠️ 必须【单独】给，不能拿 position_min_ecd 当目标（2026-10-11 修正）：
+     *    position_min_ecd 是"行程下限"，它可以（也曾经）配在机械死点之下，
+     *    于是每次命令超时的受控缓降都会一路顶进死点 → 500 ms 后
+     *    DESCENT_STALL 锁存 → 输出全零 → 不自锁机构掉车。
+     *    本机构的零点是"齿条顶死的机械最低点"，缓降目标是零点上方一点点
+     *    （LIFT_TRAVEL_PARK_ECD），不是行程下限。
+     */
+    int32_t descent_target_ecd[LIFT_CHANNEL_COUNT];
     /* 本模块硬限幅，兜住上层任何越界请求 */
     int16_t current_limit;
     /* 缓降判定：|speed| <= 该值且持续 descent_stall_ms 视为降不动 */

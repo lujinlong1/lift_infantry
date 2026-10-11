@@ -93,6 +93,8 @@ typedef struct
     volatile int32_t position_min_ecd[4];
     volatile int32_t position_max_ecd[4];
     volatile int16_t descent_current[4];
+    /* 缓降停止位置（单轴计数，已找零坐标）。见 lift_guard.h 里的说明。 */
+    volatile int32_t descent_target_ecd[4];
     volatile int16_t guard_current_limit;
     volatile int16_t guard_stall_speed_rpm;
     volatile uint32_t guard_stall_ms;
@@ -115,7 +117,12 @@ typedef struct
     volatile float period_s;
     volatile int32_t settle_tolerance_ecd;
     volatile int32_t limit_margin_ecd;
+    /*
+     * 重力/保持前馈（单轴电流量纲，填正数 = 抬升方向）。
+     * 只在四轴最低的那根高过 feedforward_min_position_ecd 时施加。
+     */
     volatile float gravity_feedforward_current;
+    volatile int32_t feedforward_min_position_ecd;
     volatile float actuator_gain_ecd_s_per_current;
 } lift_control_debug_t;
 
@@ -187,9 +194,27 @@ typedef struct
     /*
      * 行程软限位的实际区间（已找零坐标，含余量）。发布出来是给命令来源
      * （遥控映射）用的：来源必须知道"能推到哪"，而不是自己再猜一套数字。
+     *
+     * ⚠️ 单位说明（2026-10-11 修正）：
+     *   limit_height_*_ecd[ch]      是【单轴】行程，模态限幅内部用；
+     *   command_height_*_ecd        是【模态高度】= 四轴之和 = 4 × 单轴，
+     *                               命令面的 target_height_ecd 与
+     *                               actual_height 都是这个量纲。
+     *   两者以前混用：命令面（遥控/安全夹取）拿单轴区间去夹模态目标，
+     *   结果可达高度只有配置行程的 1/4。命令来源一律用 command_height_*。
      */
     volatile int32_t limit_height_min_ecd[4];
     volatile int32_t limit_height_max_ecd[4];
+    volatile int32_t command_height_min_ecd;
+    volatile int32_t command_height_max_ecd;
+    /* 模态限幅比例 0..1：<1 表示有轴接近行程界、出力被统一压制。 */
+    volatile float limit_scale;
+    volatile bool limit_active;
+    /* 控制链内部量（模态量纲），排障用：斜坡后目标 / 位置环输出 / 限幅前控制量 */
+    volatile int32_t ramped_height_ecd;
+    volatile int32_t target_speed_height_ecd_s;
+    volatile int32_t control_effort_height;
+    volatile int32_t error_height_ecd;
     volatile uint32_t command_age_ms;
     volatile uint32_t update_count;
     volatile uint32_t parameter_apply_count;

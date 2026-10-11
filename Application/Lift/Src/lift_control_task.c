@@ -101,14 +101,38 @@
  *
  * 25000 这个上限是【占位】：齿条真实有效行程还没量（LIFT-009）。
  * 量法：找零后手推到另一端，看 homed_position_ecd 的跨度。
+ *
+ * ⚠️ 2026-10-11 修正下限：原来是 -2000，低于机械死点。但 10.10 的实测结论是
+ *   "零点是齿条顶死的最低点 ⇒ position_min = 0 才安全"。配在死点之下等于
+ *   允许控制器往死点里推 2000 计数，受控缓降会一路顶死点然后报
+ *   DESCENT_STALL。已改成 0。
  */
-#define LIFT_TRAVEL_MIN_ECD                 (-2000)
+#define LIFT_TRAVEL_MIN_ECD                 0
 #define LIFT_TRAVEL_MAX_ECD                 25000
+/*
+ * 停放点（缓降停止位置，单轴计数）：零点上方一点点。
+ * 缓降是"把车放下来"，放到机械死点前就该停——不能拿 MIN 当目标。
+ */
+#define LIFT_TRAVEL_PARK_ECD                200
 /* 上电/未找零时的安全起点：不往上顶，先给一个确定的小高度。 */
 #define LIFT_TRAVEL_START_ECD               2000
 #define LIFT_TRAVEL_MARGIN_ECD              800
 #define LIFT_LIMIT_ROLL_MAX_ECD             6000
 #define LIFT_LIMIT_PITCH_MAX_ECD            6000
+/*
+ * 重力前馈的施加门槛（单轴计数）：四轴最低的那根高过它才给保持电流。
+ * 车压在最低端时重量由地面承担，给电流只会白烧电机。
+ */
+#define LIFT_FEEDFORWARD_MIN_ECD            400
+
+/*
+ * 命令面（模态高度 = 四轴之和）的边界余量与安全起点。
+ * 单轴常数换算到命令面要乘通道数——这是本项目反复踩的 4 倍陷阱。
+ */
+#define LIFT_COMMAND_MARGIN_ECD \
+    (LIFT_TRAVEL_MARGIN_ECD * (int32_t)LIFT_CHANNEL_COUNT)
+#define LIFT_COMMAND_START_ECD \
+    (LIFT_TRAVEL_START_ECD * (int32_t)LIFT_CHANNEL_COUNT)
 
 /* ==================================================================== */
 /*  1b. 实测电流与机构关系（2026-10-09，无载、保留齿轮）                 */
@@ -187,15 +211,14 @@
 /*
  * 缓降电流：把车放下来（齿条缩回），方向为【逻辑负】。
  *
- * ⚠️ 不能取小值。机构关系（2026-10-09 用户确认）是：
- *     齿条向下伸 → 把车顶起来（抬升）
- *     齿条向上缩 → 车降下来（缓降的方向，也是撞死点的方向）
- *   所以"缓降"要克服的是：静摩擦(≈2000) **加上** 车重对缩回的阻力——
- *   车重在这里是【阻碍】缩回的，不是帮手（与四丝杆机构正好相反，
- *   这是老思路最容易带错的一个符号）。
- *   取 -1500 会连静摩擦门槛都过不去，直接报 DESCENT_STALL。
+ * ⚠️ 必须取够大，但理由要写对（2026-10-11 修正）：
+ *     齿条向下伸 → 把车顶起来（抬升）；齿条向上缩 → 车降下来（缓降方向）。
+ *   车重压在齿条上、方向是【把齿条压回去（缩回）】，所以重力是【帮】下降的，
+ *   不是阻碍——本文件上面 SEEK 那一段写的就是这个，两处曾经自相矛盾。
+ *   缓降取小了走不动，原因是【静摩擦】实测门槛约 2000（无载），
+ *   不是重力：电流必须先松开静摩擦。取 -1500 连门槛都过不去 → DESCENT_STALL。
  *
- * 落地后必须重标：车重加上去以后，能缩回的最小电流会变大。
+ * 落地后必须重标：车重加上去以后，能缩回的最小电流会变。
  */
 #define LIFT_FACTORY_DESCENT_CURRENT        (-2500)
 
@@ -507,6 +530,7 @@ static void lift_build_config(
          */
         config->guard.direction[ch] = 1;
         config->guard.descent_current[ch] = debug->descent_current[ch];
+        config->guard.descent_target_ecd[ch] = debug->descent_target_ecd[ch];
     }
 
     config->guard.current_limit = debug->guard_current_limit;
@@ -538,13 +562,10 @@ static void lift_build_config(
     config->control.limit_margin_ecd = debug->limit_margin_ecd;
     config->control.gravity_feedforward_current =
         debug->gravity_feedforward_current;
+    config->control.feedforward_min_position_ecd =
+        debug->feedforward_min_position_ecd;
     config->control.actuator_gain_ecd_s_per_current =
         debug->actuator_gain_ecd_s_per_current;
-
-    config->control.limit_roll_min_ecd = -LIFT_LIMIT_ROLL_MAX_ECD;
-    config->control.limit_roll_max_ecd = LIFT_LIMIT_ROLL_MAX_ECD;
-    config->control.limit_pitch_min_ecd = -LIFT_LIMIT_PITCH_MAX_ECD;
-    config->control.limit_pitch_max_ecd = LIFT_LIMIT_PITCH_MAX_ECD;
 }
 
 /** 上电标定默认值：全部是占位值 + 保守电流，标定后逐条替换。 */
@@ -561,6 +582,8 @@ static void lift_set_default_debug(void)
     g_lift_control_debug.actuator_gain_ecd_s_per_current =
         LIFT_ACTUATOR_GAIN_ECD_S_PER_CURRENT;
     g_lift_control_debug.gravity_feedforward_current = 0.0F;
+    g_lift_control_debug.feedforward_min_position_ecd =
+        LIFT_FEEDFORWARD_MIN_ECD;
     g_lift_control_debug.settle_tolerance_ecd = 200;
     g_lift_control_debug.limit_margin_ecd = LIFT_TRAVEL_MARGIN_ECD;
     /* 60 计数/周期 @5 ms = 12000 计数/s ≈ 0.59 mm/周期，防冲击。 */
@@ -634,6 +657,11 @@ static void lift_set_default_debug(void)
         g_lift_control_debug.position_max_ecd[ch] = LIFT_TRAVEL_MAX_ECD;
         g_lift_control_debug.descent_current[ch] =
             LIFT_FACTORY_DESCENT_CURRENT;
+        /*
+         * 缓降停止位置：零点上方一点点（不是 position_min——那是行程下限，
+         * 允许配在死点下方；拿它当目标会让每次超时缓降都顶死点）。
+         */
+        g_lift_control_debug.descent_target_ecd[ch] = LIFT_TRAVEL_PARK_ECD;
     }
 
     lift_derive_gains(&g_lift_control_debug);
@@ -791,6 +819,40 @@ static int32_t lift_clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
     return value;
 }
 
+/*
+ * ---- 命令面高度的单位换算（2026-10-11 修正）--------------------------
+ *
+ *   target_height_ecd / actual_height 都是【模态高度】= 四轴之和
+ *   （lift_sync 的转置伴随约定，不除 4）；
+ *   position_min_ecd[ch] / position_max_ecd[ch] 是【单轴】行程。
+ *
+ * 所以命令面的边界必须是"四轴之和"：
+ *      下限 = Σ(单轴下限) + 余量      上限 = Σ(单轴上限) − 余量
+ *
+ * 以前直接拿单轴区间去夹模态目标，后果是**可达高度只有配置行程的 1/4**，
+ * 而且遥控与安全层各用一套边界（推到头目标被"偷走"）。
+ * 命令来源（遥控映射）一律用发布出去的 command_height_min/max_ecd。
+ */
+static int32_t lift_command_travel_sum(bool upper)
+{
+    int32_t total = 0;
+    uint32_t ch;
+
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        total += upper ? g_lift_control_debug.position_max_ecd[ch]
+                       : g_lift_control_debug.position_min_ecd[ch];
+    }
+    return total;
+}
+
+/** 命令面允许的高度区间（模态量纲，已含余量）。 */
+static void lift_command_height_bounds(int32_t *minimum, int32_t *maximum)
+{
+    *minimum = lift_command_travel_sum(false) + LIFT_COMMAND_MARGIN_ECD;
+    *maximum = lift_command_travel_sum(true) - LIFT_COMMAND_MARGIN_ECD;
+}
+
 /**
  * @brief 把上层给的目标压到安全范围内。
  * @return true 表示目标被压过（safety_limited 会置位，供 Watch 看见）。
@@ -802,9 +864,9 @@ static int32_t lift_clamp_i32(int32_t value, int32_t minimum, int32_t maximum)
  */
 static bool lift_apply_safety(const lift_top_status_t *top_status)
 {
-    const int32_t minimum = LIFT_TRAVEL_MIN_ECD + LIFT_TRAVEL_MARGIN_ECD;
-    const int32_t maximum = LIFT_TRAVEL_MAX_ECD - LIFT_TRAVEL_MARGIN_ECD;
-    const int32_t start = LIFT_TRAVEL_START_ECD;
+    int32_t minimum;
+    int32_t maximum;
+    const int32_t start = LIFT_COMMAND_START_ECD;
     bool limited = false;
     bool any_not_homed = false;
     uint32_t ch;
@@ -818,6 +880,7 @@ static bool lift_apply_safety(const lift_top_status_t *top_status)
     }
 
     taskENTER_CRITICAL();
+    lift_command_height_bounds(&minimum, &maximum);
     if (g_lift_task_command.target_height_ecd > maximum)
     {
         /*
@@ -911,6 +974,35 @@ static void lift_publish_status(
     g_lift_control_status.target_roll_ecd = command->target_roll_ecd;
     g_lift_control_status.target_pitch_ecd = command->target_pitch_ecd;
 
+    /*
+     * 控制链内部量（都是模态量纲）。以前这些只在 lift_top_status 里算完就
+     * 扔掉，Watch 里看不到——"限位到底有没有在压我的输出"只能靠猜。
+     */
+    g_lift_control_status.limit_scale = top_status->control.limit_scale;
+    g_lift_control_status.limit_active = top_status->control.limit_active;
+    g_lift_control_status.ramped_height_ecd =
+        top_status->control.ramped_height_ecd;
+    g_lift_control_status.target_speed_height_ecd_s =
+        top_status->control.target_speed_height;
+    g_lift_control_status.control_effort_height =
+        top_status->control_effort_height;
+    g_lift_control_status.error_height_ecd =
+        top_status->control.error_height_ecd;
+
+    /*
+     * 命令面允许的高度区间（模态量纲，含余量）。命令来源按它夹取，
+     * 就与 lift_apply_safety 用的是同一套边界，不会再出现"推到某个值
+     * 被安全层改写回起点"的怪现象。
+     */
+    {
+        int32_t minimum;
+        int32_t maximum;
+
+        lift_command_height_bounds(&minimum, &maximum);
+        g_lift_control_status.command_height_min_ecd = minimum;
+        g_lift_control_status.command_height_max_ecd = maximum;
+    }
+
     for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
     {
         g_lift_control_status.homing_state[ch] =
@@ -968,6 +1060,14 @@ static void lift_control_task(void *argument)
         const bool command_fresh =
             g_lift_task_command.enabled &&
             (command_age <= pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS));
+        /*
+         * 这一组电流是否被别的模块占用（台架点动 / CAN 测试）。
+         * 占用期间主链完全不下发，也不能把这些周期当成"命令超时"。
+         */
+        const bool bench_owns =
+            g_dji_can_test_status.running ||
+            g_dji_can_test_status.zero_holding ||
+            g_lift_jog_status.running;
         bool all_online = true;
         uint32_t ch;
 
@@ -980,6 +1080,11 @@ static void lift_control_task(void *argument)
         (void)memset(&control_command, 0, sizeof(control_command));
         /* 安全层用的是上一周期的找零状态：命令必须在 UPDATE 之前就夹好。 */
         lift_safety_limited = lift_apply_safety(&lift_last_status);
+        if (lift_safety_limited)
+        {
+            /* 以前这个计数器只声明、没人写，Watch 里永远显示 0。 */
+            g_lift_control_status.safety_refresh_count++;
+        }
         lift_snapshot_command(&command);
         robot_motors_get_snapshot(&motors);
 
@@ -992,6 +1097,25 @@ static void lift_control_task(void *argument)
         control_command.target_height_ecd = command.target_height_ecd;
         control_command.target_roll_ecd = command.target_roll_ecd;
         control_command.target_pitch_ecd = command.target_pitch_ecd;
+
+        /*
+         * 台架点动 / CAN 测试占用这一组电流时（bench_owns）：
+         * 主链本来就不出力（下面的门禁挡着），但**不能**把"没有新命令"
+         * 理解成遥控失联——否则占用期间主链会一路走受控缓降状态，
+         * 占用一结束就把车往下放。
+         * 处理：命令当作新鲜的，并把目标吸附到当前姿态（lift_last_status
+         * 是上一周期的实际模态）。于是台架放手后主链的动作是"保持"。
+         */
+        if (bench_owns)
+        {
+            input.command_fresh = true;
+            control_command.target_height_ecd =
+                lift_last_status.actual_modes.height;
+            control_command.target_roll_ecd =
+                lift_last_status.actual_modes.roll;
+            control_command.target_pitch_ecd =
+                lift_last_status.actual_modes.pitch;
+        }
 
         for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
         {
@@ -1048,12 +1172,30 @@ static void lift_control_task(void *argument)
                 }
             }
 
-            robot_lift_set_currents(
-                applied[0], applied[1], applied[2], applied[3]);
+            /*
+             * ⚠️ 被别的模块占用时【不写】这一组电流，而不是"写 0"。
+             *
+             * 2026-10-11 修正：原来门禁是写 0，而占用方（台架点动）每 5 ms
+             * 也在写这一组——两个同周期同优先级的任务抢同一个命令缓存，
+             * 发送任务（2 ms 一帧）取到的是"谁最后写"，于是点动电流被主链的
+             * 0 斩波：实际送进 C620 的电流带一个未知的占空比，
+             * K、启动门槛、保持电流这些标定数据全部失真。
+             *
+             * 现在：占用期间主链完全不碰这一组，由占用方独占；
+             * 但"参数没生效 / 掉线"两种门禁仍然主动写 0 —— 那是保护动作，
+             * 必须真的把电流压掉。
+             */
+            if (gate != (uint8_t)LIFT_OUTPUT_GATE_JOG &&
+                gate != (uint8_t)LIFT_OUTPUT_GATE_CAN_TEST)
+            {
+                robot_lift_set_currents(
+                    applied[0], applied[1], applied[2], applied[3]);
+            }
 
             lift_publish_status(
                 &top_status, &motors, &command, applied, gate, now,
-                lift_configuration_applied && all_online && command_fresh);
+                lift_configuration_applied && all_online &&
+                (command_fresh || bench_owns));
         }
         g_lift_control_status.update_count++;
 

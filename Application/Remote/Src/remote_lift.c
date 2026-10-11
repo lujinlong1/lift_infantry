@@ -117,11 +117,27 @@ void remote_lift_init(void)
     (void)memset(&g_remote_lift_status, 0, sizeof(g_remote_lift_status));
     (void)memset(&lift_state, 0, sizeof(lift_state));
 
-    g_remote_lift_debug.enabled = true;
+    /*
+     * ⚠️ 默认【关闭】：抬升目前只在 debug 里调（Watch 直接写
+     *    g_lift_task_command，或用台架模块 lift_jog_task）。
+     * 打开之前必须先定两件事（见 remote_lift.h 文件头）：
+     *   ① 用哪个操作件抬升——stick_channel 默认 1 与 Pitch 抢同一个通道；
+     *   ② 找零/清零点的三段拨杆时序从没在实机上跑通过。
+     */
+    g_remote_lift_debug.enabled = false;
     g_remote_lift_debug.stick_channel = 1;
     g_remote_lift_debug.stick_deadband = 30;
-    /* 20 计数/周期 @10 ms = 2000 计数/s ≈ 98 mm/s（按 216.8 mm/圈折算）。 */
-    g_remote_lift_debug.stick_scale = 20.0F;
+    /*
+     * 摇杆量 → 每周期目标增量（【模态高度】计数，目标量纲见 lift_control_task.h）。
+     * 0.91 × 满杆 660 ≈ 600 模态计数/周期，正好等于 max_target_step_ecd，
+     * 于是【全行程都是线性的】，不会一推过死区就顶到限幅。
+     *
+     * 换算：600 模态计数/周期 = 150 单轴计数/周期 @10 ms = 15000 单轴计数/s
+     *       ÷ 725 计数/mm ≈ 20.7 mm/s（单轴齿条速度）。
+     * （旧注释写"20 计数/周期 ≈ 98 mm/s"两处都不对：20 是"每摇杆单位"不是
+     *   满杆，而 98 mm/s 既没乘 660 也没做模态→单轴的 4 倍折算。）
+     */
+    g_remote_lift_debug.stick_scale = 0.91F;
     g_remote_lift_debug.stick_filter_tau_s = 0.05F;
     g_remote_lift_debug.stick_direction = 1;
     g_remote_lift_debug.max_target_step_ecd = 600;
@@ -143,8 +159,13 @@ void remote_lift_map(
     remote_lift_left_t left,
     uint32_t now_ms)
 {
-    const int32_t height_min = g_lift_control_status.limit_height_min_ecd[0];
-    const int32_t height_max = g_lift_control_status.limit_height_max_ecd[0];
+    /*
+     * 命令面用【模态高度】边界（= 四轴之和，已含余量），不是单轴行程：
+     * 以前拿 limit_height_*_ecd[0] 夹模态目标，可达高度只有配置行程的 1/4，
+     * 而且与 lift_apply_safety 用的边界不是同一套（推到头会被改写回起点）。
+     */
+    const int32_t height_min = g_lift_control_status.command_height_min_ecd;
+    const int32_t height_max = g_lift_control_status.command_height_max_ecd;
     const int32_t limits_valid = height_max - height_min;
     const int32_t tolerance = remote_lift_abs_i32(
         g_remote_lift_debug.level_tolerance_ecd);

@@ -318,9 +318,14 @@ void lift_control_init(lift_control_t *self, const lift_control_config_t *config
     }
     if (self->config.gravity_feedforward_current < 0.0F)
     {
-        /* 配置填的是"保持电流大小"，取绝对值；方向由模块内部固定为向下。 */
+        /* 配置填的是"保持电流大小"，取绝对值；方向由模块内部固定为【抬升】。 */
         self->config.gravity_feedforward_current =
             -self->config.gravity_feedforward_current;
+    }
+    if (self->config.feedforward_min_position_ecd < 0)
+    {
+        self->config.feedforward_min_position_ecd =
+            -self->config.feedforward_min_position_ecd;
     }
 
     /*
@@ -345,16 +350,6 @@ void lift_control_init(lift_control_t *self, const lift_control_config_t *config
                 self->config.limit_height_min_ecd[ch] = -wide;
                 self->config.limit_height_max_ecd[ch] = wide;
             }
-        }
-        if (self->config.limit_roll_max_ecd <= self->config.limit_roll_min_ecd)
-        {
-            self->config.limit_roll_min_ecd = -wide;
-            self->config.limit_roll_max_ecd = wide;
-        }
-        if (self->config.limit_pitch_max_ecd <= self->config.limit_pitch_min_ecd)
-        {
-            self->config.limit_pitch_min_ecd = -wide;
-            self->config.limit_pitch_max_ecd = wide;
         }
     }
 
@@ -391,6 +386,7 @@ void lift_control_update(
     float speed_output[LIFT_CONTROL_MODE_COUNT];
     int32_t target_speed[LIFT_CONTROL_MODE_COUNT];
     uint32_t m;
+    uint32_t ch;
 
     if ((self == NULL) || (position == NULL) || (speed_rpm == NULL) ||
         (command == NULL) || (effort == NULL) || (status == NULL))
@@ -415,18 +411,42 @@ void lift_control_update(
     status->at_target = false;
 
     /*
-     * 重力前馈：丝杆不自锁，停在行程中间时托住车身的力【只能】由电机出。
-     * 配置值填的是"保持电流大小"（正数），这里按【向下】施加。
+     * 重力/保持前馈：本机构不自锁，停在行程中间时托住车身的力【只能】由电机出。
+     * 配置值填的是"保持电流大小"（正数），这里按【抬升方向（逻辑正）】施加。
      *
-     * 前馈刻意只加负向（向下）：
-     *   - 车在行程中间，它抵消重力，让位置环只纠残余误差；
-     *   - 车压在下限时，重力本来由挡块承担，再给向上的力只会白烧电机。
+     * ⚠️ 2026-10-11 修正：此前这里是 `-gravity_feedforward_current`，按"向下"
+     *    施加——方向是反的。实测确认的机构关系是"正电流 = 齿条伸出 = 把车
+     *    顶起来"，要托住车必须给正向电流；而且台架模块的 hold_feedforward_
+     *    current 一直是正向相加，同一固件里两处符号相反本身就是信号。
+     *    旧方向若真的填了标定值，现象是"越给保持电流车掉得越快"。
+     *
+     * 施加门槛：四轴里【最低】的那根高过 feedforward_min_position_ecd 才施加。
+     * 车压在最低端（零点）时重量由地面/挡块承担，再给正向电流只会白烧电机。
      *
      * 若不给这份前馈，保持电流就只能靠位置环积分去凑，而"要出力就必须有
      * 误差"，于是位置永远收敛不到目标——仿真里表现为目标 20000、
      * 稳态停在 18974（差 5.1%），三个模态看起来却都"收敛了"。
      */
-    feedforward.height = -(int32_t)self->config.gravity_feedforward_current;
+    {
+        int32_t lowest = position[0];
+
+        for (ch = 1U; ch < LIFT_CHANNEL_COUNT; ch++)
+        {
+            if (position[ch] < lowest)
+            {
+                lowest = position[ch];
+            }
+        }
+
+        if (lowest > self->config.feedforward_min_position_ecd)
+        {
+            feedforward.height = (int32_t)self->config.gravity_feedforward_current;
+        }
+        else
+        {
+            feedforward.height = 0;
+        }
+    }
     feedforward.roll = 0;
     feedforward.pitch = 0;
 
@@ -516,8 +536,14 @@ void lift_control_update(
      * 把前馈并入之后再统一算比例 s，使得"控制量 + 前馈"这个实际下发的量
      * 不会让任何一根轴越过行程。前馈也参与限幅，否则它自己就能把轴推过界。
      *
-     * 注意 s 只压【向上】的合成量；向下的前馈（托住车身）在到界时本来就
-     * 不该再往上了，被压到 0 是正确行为。
+     * 比例 s 由【控制量 + 前馈】的合成量算出（见 control_limit_scale），
+     * 但最终只乘在 PID 控制量上：
+     *      最终 = 控制量 × s + 前馈
+     *
+     * 前馈【故意不被 s 压掉】：它是"托住车"的静态力。车停在上限附近时正要
+     * 靠它保持高度，若把它一起压成 0，车会直接掉下来（本机构不自锁）。
+     * 而"到界了还继续往上顶"这件事由控制量那一项被压成 0 来阻止——
+     * 前馈是静态保持力，不会随周期累积成越界位移。
      */
     {
         const float limit_scale = control_limit_scale(

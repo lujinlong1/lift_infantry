@@ -49,7 +49,12 @@
  */
 #define LIFT_TEST_FORCE_PER_CURRENT_N      0.5705F
 
-/* 每轴力缩放的有效范围：非法值一律当 1.0，避免一个笔误把某根轴送飞。 */
+/*
+ * 每轴力缩放的有效范围（LIFT_TEST_SCALE_MAX 是上限）。
+ *   0 或负数 / 超上限 / NaN  → 【关掉这根轴】（输出 0），见 lift_test_clamp_scale()。
+ * 2026-10-11 修正：以前非法值一律回落 1.0 = 满力，于是"填 0 想关一根轴"
+ * 得到的是满力。LIFT_TEST_SCALE_MIN 不再作为下限使用，只留作参考下限值。
+ */
 #define LIFT_TEST_SCALE_MIN                0.05F
 #define LIFT_TEST_SCALE_MAX                4.0F
 
@@ -63,6 +68,15 @@ static StackType_t   lift_test_task_stack[LIFT_TEST_TASK_STACK_WORDS];
 /* ---- 内部状态 ---- */
 static bool     test_running;                         /* 模式是否已开始 */
 static uint8_t  test_active_mode;
+/*
+ * 启动用的边沿检测（2026-10-11 修 LENGTH 自动重跑）：
+ *   test_enabled_last = 上一次本模式的 enabled
+ *   test_seen_mode    = 上一次服务的 mode 变量
+ * 只有"enabled 由 0 变 1"或"mode 变量变了"才启动新的一次运行。
+ * 不能用 test_running 当判据：end() 会把它清 0，下一次循环立刻又启动。
+ */
+static bool     test_enabled_last;
+static uint8_t  test_seen_mode = (uint8_t)LIFT_TEST_MODE_OFF;
 static uint32_t test_start_tick;
 static uint32_t test_duration_ticks;
 static int32_t  test_start_raw[LIFT_CHANNEL_COUNT];   /* 使能那一刻的原始位置 */
@@ -128,13 +142,16 @@ static int16_t lift_test_force_to_current_total(float force_n)
 
 static float lift_test_clamp_scale(float scale)
 {
+    /*
+     * ⚠️ 2026-10-11 修正语义：以前"非法值（含 0 与负数）一律回落 1.0 = 满力"，
+     *    本意是"别让笔误把某根轴送飞"，实际效果正相反——想用
+     *    `axis_scale = 0` 关掉一根轴，得到的是【满力】。
+     *    现在：<= 0 或超上限（含 NaN）一律视为"关掉这根轴"，输出 0。
+     *    要减弱一根轴就填一个 (0, LIFT_TEST_SCALE_MAX] 里的正数。
+     */
     if (!(scale > 0.0F) || (scale > LIFT_TEST_SCALE_MAX))
     {
-        return 1.0F;
-    }
-    if (scale < LIFT_TEST_SCALE_MIN)
-    {
-        return LIFT_TEST_SCALE_MIN;
+        return 0.0F;
     }
     return scale;
 }
@@ -406,6 +423,26 @@ static void lift_test_end(void)
     test_active_mode = (uint8_t)LIFT_TEST_MODE_OFF;
     g_lift_jog_status.active_mode = (uint8_t)LIFT_TEST_MODE_OFF;
     lift_test_zero_output();
+}
+
+/*
+ * @brief 启动判定（纯逻辑，单独抽出来便于主机单测）。
+ *
+ * 只有两种情况算"一次新的运行"：
+ *   ① 本模式的 enabled 由 0 变 1（上升沿）；
+ *   ② mode 变量本身变了（切模式）。
+ * 结束时 end() 会把 test_running 清 0，但这里【不看】test_running ——
+ * 否则下一拍就会自己重新启动（LENGTH 会一直重复爬升、距离累加）。
+ * 想再跑一次：先把 enabled 清 0 再置 1，或者换一次模式。
+ */
+static bool lift_test_should_start(bool enabled, uint8_t mode)
+{
+    const bool start = enabled &&
+        (!test_enabled_last || (mode != test_seen_mode));
+
+    test_enabled_last = enabled;
+    test_seen_mode = mode;
+    return start;
 }
 
 /*
@@ -912,6 +949,27 @@ static void lift_test_run_length(uint32_t now)
 /*  模式 3：四轴恒定力（开环）                                            */
 /* ==================================================================== */
 
+/*
+ * FORCE 抬升段结束（到时间或堵转）。
+ *
+ * 若保持力折算出来是 0，就【彻底交还】这一组电流：结束本次运行
+ * （running 清 0、写一次 0），主抬升链才能重新接管这一组。
+ * 否则只结束抬升段，继续按 hold_force_n 保持 —— 那是"松手不掉"的用法，
+ * 此时仍然由本模块独占，主链保持被门禁挡住。
+ *
+ * 为什么以前会卡住：FORCE 只把 active 清 0，从不结束运行，于是
+ * running 一直是 1，主抬升链被永久门禁，现象是"点动做完了、遥控/主链推不动"。
+ */
+static void lift_test_force_finish(void)
+{
+    g_lift_jog_status.active = false;
+
+    if (lift_test_force_to_current_total(g_lift_test.force.hold_force_n) == 0)
+    {
+        lift_test_end();
+    }
+}
+
 static void lift_test_run_force(uint32_t now)
 {
     int16_t currents[LIFT_CHANNEL_COUNT];
@@ -1009,7 +1067,8 @@ static void lift_test_run_force(uint32_t now)
             if ((uint32_t)(now - test_force_stall_tick) >= stall_ticks)
             {
                 g_lift_jog_status.stall_latched = true;
-                g_lift_jog_status.active = false;
+                lift_test_force_finish();
+                return;
             }
         }
         else
@@ -1020,7 +1079,8 @@ static void lift_test_run_force(uint32_t now)
 
         if (elapsed >= test_duration_ticks)
         {
-            g_lift_jog_status.active = false;
+            lift_test_force_finish();
+            return;
         }
 
         g_lift_jog_status.remaining_ms = (elapsed >= test_duration_ticks)
@@ -1086,6 +1146,12 @@ static void lift_test_task(void *argument)
              * 这样用户能在 Watch 里看到"上次为什么没动"。
              */
             g_lift_jog_status.offline_abort = false;
+            /*
+             * 边沿状态跟着实际值走：enabled 已经是 0 → 下次置 1 才算上升沿；
+             * abort 还是 1 而 enabled 仍为 1 → 不产生新的上升沿，避免
+             * "解除全停时悄悄自己又跑一次"。返回值在这里不用。
+             */
+            (void)lift_test_should_start(enabled, mode);
             vTaskDelayUntil(
                 &last_wake_tick, pdMS_TO_TICKS(LIFT_TEST_PERIOD_MS));
             continue;
@@ -1109,8 +1175,18 @@ static void lift_test_task(void *argument)
             continue;
         }
 
-        /* ---- 上升沿（或换了模式）：装载 PID、记起点 ---- */
-        if (!test_running || (test_active_mode != mode))
+        /*
+         * ---- 启动条件：本模式 enabled 的【上升沿】，或 mode 变量刚变过 ----
+         *
+         * ⚠️ 2026-10-11 修正：原判据是 `!test_running || 换了模式`，而 end()
+         *    会把 test_running 清 0 → 下一拍立刻又 begin()：LENGTH 一跑完就
+         *    自动重来、起点重记、距离一直接着累加；FORCE 同理会被反复重启。
+         *    而且"切到一个 enabled 已经是 1 的模式"会立刻启动，与注释写的
+         *    "enabled 上升沿"不符。
+         * 现在只认两件事：enabled 由 0 变 1，或者 mode 变量本身变了。
+         * 想再跑一次：先把 enabled 清 0 再置 1（或换一次模式）。
+         */
+        if (lift_test_should_start(enabled, mode))
         {
             /* 两个闭环模式共用同一套串级参数，所以判断合并成一条 */
             if ((mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS) ||
@@ -1239,13 +1315,21 @@ bool lift_jog_task_create(void)
         g_lift_test.speed_pid[ch].kp = 60.0F;
         g_lift_test.speed_pid[ch].ki = 0.0F;
         g_lift_test.speed_pid[ch].kd = 0.0F;
-        g_lift_test.speed_pid[ch].integral_limit = 0.0F;
+        /*
+         * ⚠️ integral_limit 的 0 = 【积分恒为 0】，不是"不限"！
+         *    pid.c 的 pid_clamp() 是正负对称钳位，钳位到 0 就是把积分项清零。
+         *    所以想用 ki 就必须先给 integral_limit 一个正数，否则怎么调 ki
+         *    都毫无反应（2026-10-11 修：原来这里是 0，等于把 ki 焊死）。
+         *    单位是"误差×秒"：速度环误差是 ecd/s，20000 ≈ 满速误差 2 s 的量。
+         */
+        g_lift_test.speed_pid[ch].integral_limit = 20000.0F;
         g_lift_test.speed_pid[ch].output_limit = 16000.0F;
 
         g_lift_test.position_pid[ch].kp = 5.0F;
         g_lift_test.position_pid[ch].ki = 0.0F;
         g_lift_test.position_pid[ch].kd = 0.0F;
-        g_lift_test.position_pid[ch].integral_limit = 0.0F;
+        /* 同理：0 会把位置环积分焊死。4000 = 位置环满输出速度 × 1 s。 */
+        g_lift_test.position_pid[ch].integral_limit = 4000.0F;
         /* ★ 速度量纲：最高 4000 ecd/s ≈ 5.5 mm/s。它不是电流！ */
         g_lift_test.position_pid[ch].output_limit = 4000.0F;
 
