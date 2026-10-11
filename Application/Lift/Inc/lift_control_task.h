@@ -124,6 +124,19 @@ typedef struct
     volatile float gravity_feedforward_current;
     volatile int32_t feedforward_min_position_ecd;
     volatile float actuator_gain_ecd_s_per_current;
+
+    /*
+     * ---- 平滑链（2026-10-11 从台架模块移植，量纲都是【模态量】）--------
+     * 模态量 = 四轴之和 = 单轴 × 4；默认值在 lift_control_task.c 的 1c 节
+     * 按 mm/s 换算出来，要改"抬升多快"只动 LIFT_TARGET_RATE_MM_S 一个数。
+     */
+    volatile int32_t approach_zone_ecd;         /* 减速区起点（模态计数） */
+    volatile int32_t approach_min_speed_ecd_s;  /* 减速区最低速度（模态 ecd/s） */
+    volatile int32_t hold_speed_ecd_s;          /* 判"停住"（模态 ecd/s） */
+    volatile int32_t current_ramp_per_s;        /* 电流 di/dt（模态电流/秒） */
+    volatile int32_t current_limit_start;       /* 逐级开放起点（电流） */
+    volatile int32_t current_limit_ramp_per_s;  /* 逐级开放速度（电流/秒） */
+    volatile int32_t speed_filter_tau_ms;       /* 速度反馈低通（ms，0 = 关） */
 } lift_control_debug_t;
 
 /* 平铺的 volatile 状态，专供 Keil Watch 与调试记录使用。 */
@@ -215,6 +228,14 @@ typedef struct
     volatile int32_t target_speed_height_ecd_s;
     volatile int32_t control_effort_height;
     volatile int32_t error_height_ecd;
+    /*
+     * 平滑链的实时状态（按模态：0 = 高度 / 1 = 横滚 / 2 = 俯仰）：
+     *   mode_hold_state          0 = APPROACH / 1 = BRAKE / 2 = HOLD
+     *   mode_limit_open_current  本周期逐级开放后的电流上限
+     * "到位了为什么还在动/还有电流"先看这两个。
+     */
+    volatile uint8_t mode_hold_state[3];
+    volatile int32_t mode_limit_open_current[3];
     volatile uint32_t command_age_ms;
     volatile uint32_t update_count;
     volatile uint32_t parameter_apply_count;

@@ -89,8 +89,7 @@
 #define LIFT_ACTUATOR_GAIN_ECD_S_PER_CURRENT  0.5F
 
 /* 内环回路增益目标 GH = Kp·(4K)·h，稳定条件 GH < 2；取 0.30 留 6 倍余量。 */
-#define LIFT_SPEED_LOOP_GAIN_TARGET         0.30F
-/* 外环带宽取内环的 1/3：再快就会和速度环抢相位。 */
+#define LIFT_SPEED_LOOP_GAIN_TARGET         0.30F/* 外环带宽取内环的 1/3：再快就会和速度环抢相位。 */
 #define LIFT_POSITION_LOOP_BANDWIDTH_RATIO  0.33F
 
 /*
@@ -138,6 +137,57 @@
     (LIFT_TRAVEL_START_ECD * (int32_t)LIFT_CHANNEL_COUNT)
 
 /* ==================================================================== */
+/*  1c. 平滑链参数（2026-10-11 从台架模块移植，见 lift_control.h）        */
+/*                                                                    */
+/*  量纲约定：控制器的模态量 = 四轴之和 = 单轴 × 4（转置伴随，不除 4）。  */
+/*  操作手想的是"每根齿条多少 mm/s"，所以下面按 mm/s 给，换算集中在这里。  */
+/*                                                                    */
+/*  机械换算（已确认）：46齿 × 模数1.5 → 分度圆 69 mm → 216.8 mm/圈；     */
+/*  电机 19.2:1，编码器 8192/圈（转子侧）→ 单轴 725 计数/mm。            */
+/* ==================================================================== */
+
+#define LIFT_COUNTS_PER_MM_AXIS             725
+
+/* 单轴 → 模态（×4）。下面所有 MODAL 常量都走它，避免再漏乘。 */
+#define LIFT_PER_AXIS_TO_MODAL(x) \
+    ((x) * (int32_t)LIFT_CHANNEL_COUNT)
+
+/* mm/s（单轴）→ 模态 ecd/s */
+#define LIFT_MM_S_TO_MODAL_SPEED(mm_s) \
+    LIFT_PER_AXIS_TO_MODAL((mm_s) * (int32_t)LIFT_COUNTS_PER_MM_AXIS)
+
+/* mm/s（单轴）→ 模态"每控制周期步长"（目标斜坡用） */
+#define LIFT_MM_S_TO_MODAL_STEP(mm_s) \
+    LIFT_PER_AXIS_TO_MODAL( \
+        ((mm_s) * (int32_t)LIFT_COUNTS_PER_MM_AXIS * \
+         (int32_t)LIFT_CONTROL_PERIOD_MS) / 1000)
+
+/*
+ * 目标斜坡速率（单轴 mm/s）。这是"抬升有多快"的总开关：
+ * 位置环的速度上限、接近减速都跟着它量级走。
+ *   0 = 关掉斜坡（目标阶跃）——只有调 PID 时才这么干。
+ */
+#define LIFT_TARGET_RATE_MM_S               8
+/* 位置环速度上限（单轴 mm/s）：只需要略大于斜坡速率，用来兜住大误差时的冲量 */
+#define LIFT_MAX_SPEED_MM_S                 15
+/* 接近减速区起点（单轴 mm）：离目标还有这么多就开始减速 */
+#define LIFT_APPROACH_ZONE_MM               5
+/* 接近段最低目标速度（单轴 mm/s）：**不能填 0**（填 0 会卡在死区外进不去） */
+#define LIFT_APPROACH_MIN_SPEED_MM_S        1
+/* 判定"停住了"的转速（转子 rpm）：20 rpm ≈ 2730 单轴计数/s */
+#define LIFT_HOLD_SPEED_RPM                 20
+#define LIFT_HOLD_SPEED_ECD_S \
+    LIFT_PER_AXIS_TO_MODAL( \
+        ((int32_t)LIFT_HOLD_SPEED_RPM * LIFT_ECD_PER_REV) / 60)
+/* 电流 di/dt 上限（模态控制量/秒）：60000 → 5 ms 每周期 300 → 0→16000 约 0.27 s */
+#define LIFT_CURRENT_RAMP_PER_S             60000
+/* 逐级开放的起点与放开速度（用户实测"空载大幅摆动"的解药之一） */
+#define LIFT_CURRENT_LIMIT_START            2000
+#define LIFT_CURRENT_LIMIT_RAMP_PER_S       10000
+/* 速度反馈一阶低通（ms）：压 C620 整数 rpm 的量化毛刺；0 = 关 */
+#define LIFT_SPEED_FILTER_TAU_MS            20
+
+/* ==================================================================== */
 /*  1b. 实测电流与机构关系（2026-10-09，无载、保留齿轮）                 */
 /*                                                                    */
 /*  ⚠️ 机构关系（用户实测确认，P4 的方向全靠它）：                       */
@@ -176,13 +226,16 @@
  */
 #define LIFT_DERIVED_CURRENT_CEILING        16000
 /*
- * 位置环输出的限幅：量纲是【速度】(ecd/s)，不是电流，所以它跟上面的
- * 16000 没有关系，保持原值。
- *   4000 ecd/s ÷ 725 计数/mm ≈ 5.5 mm/s（四根齿条一起）
- * 之前它和电流上限共用 4000 这个数，纯属巧合，已拆开（见 lift_derive_gains）。
- * 要提速只改这一个数，别去动电流上限。
+ * 位置环输出的限幅：量纲是【速度】(模态 ecd/s)，不是电流，所以它跟上面的
+ * 16000 没有关系。
+ *
+ * ⚠️ 2026-10-11 重定：以前是 4000 模态计数/s，换算成单轴只有
+ *    4000/4 = 1000 计数/s ÷ 725 计数/mm ≈ **1.38 mm/s** —— 爬 20 cm 要 145 秒，
+ *    实际上"抬不起来"。现在改成按 mm/s 给（15 mm/s 单轴），换算过程写在下面的
+ *    宏里，要提速/降速只改 LIFT_MAX_SPEED_MM_S 一个数。
  */
-#define LIFT_POSITION_LOOP_SPEED_CEILING_ECD_S  4000
+#define LIFT_POSITION_LOOP_SPEED_CEILING_ECD_S \
+    LIFT_MM_S_TO_MODAL_SPEED(LIFT_MAX_SPEED_MM_S)
 
 /*
  * 找零的参数（机构动作序列见第 1b 节顶部）。
@@ -412,6 +465,13 @@ static bool lift_debug_config_is_valid(const lift_control_debug_t *debug)
         (debug->max_target_step_ecd < 0) ||
         (debug->settle_tolerance_ecd < 0) ||
         (debug->limit_margin_ecd < 0) ||
+        (debug->approach_zone_ecd < 0) ||
+        (debug->approach_min_speed_ecd_s < 0) ||
+        (debug->hold_speed_ecd_s < 0) ||
+        (debug->current_ramp_per_s < 0) ||
+        (debug->current_limit_start < 0) ||
+        (debug->current_limit_ramp_per_s < 0) ||
+        (debug->speed_filter_tau_ms < 0) ||
         !lift_float_valid(debug->gear_ratio) ||
         !lift_float_valid(debug->period_s) ||
         !lift_float_valid(debug->actuator_gain_ecd_s_per_current) ||
@@ -585,6 +645,15 @@ static void lift_build_config(
         debug->feedforward_min_position_ecd;
     config->control.actuator_gain_ecd_s_per_current =
         debug->actuator_gain_ecd_s_per_current;
+    /* 平滑链（2026-10-11 从台架移植） */
+    config->control.approach_zone_ecd = debug->approach_zone_ecd;
+    config->control.approach_min_speed_ecd_s = debug->approach_min_speed_ecd_s;
+    config->control.hold_speed_ecd_s = debug->hold_speed_ecd_s;
+    config->control.current_ramp_per_s = debug->current_ramp_per_s;
+    config->control.current_limit_start = debug->current_limit_start;
+    config->control.current_limit_ramp_per_s =
+        debug->current_limit_ramp_per_s;
+    config->control.speed_filter_tau_ms = debug->speed_filter_tau_ms;
 }
 
 /** 上电标定默认值：全部是占位值 + 保守电流，标定后逐条替换。 */
@@ -605,8 +674,25 @@ static void lift_set_default_debug(void)
         LIFT_FEEDFORWARD_MIN_ECD;
     g_lift_control_debug.settle_tolerance_ecd = 200;
     g_lift_control_debug.limit_margin_ecd = LIFT_TRAVEL_MARGIN_ECD;
-    /* 60 计数/周期 @5 ms = 12000 计数/s ≈ 0.59 mm/周期，防冲击。 */
-    g_lift_control_debug.max_target_step_ecd = 60;
+    /*
+     * 目标斜坡（模态计数/周期）：8 mm/s 单轴 → 29 单轴计数/周期 → 116 模态。
+     * 以前是 60（≈4.1 mm/s），现在按 mm/s 给，改 LIFT_TARGET_RATE_MM_S 即可。
+     */
+    g_lift_control_debug.max_target_step_ecd =
+        LIFT_MM_S_TO_MODAL_STEP(LIFT_TARGET_RATE_MM_S);
+
+    /* ---- 平滑链默认值（见 lift_control.h 的五件套说明）---- */
+    g_lift_control_debug.approach_zone_ecd =
+        LIFT_PER_AXIS_TO_MODAL(LIFT_APPROACH_ZONE_MM *
+                               (int32_t)LIFT_COUNTS_PER_MM_AXIS);
+    g_lift_control_debug.approach_min_speed_ecd_s =
+        LIFT_MM_S_TO_MODAL_SPEED(LIFT_APPROACH_MIN_SPEED_MM_S);
+    g_lift_control_debug.hold_speed_ecd_s = LIFT_HOLD_SPEED_ECD_S;
+    g_lift_control_debug.current_ramp_per_s = LIFT_CURRENT_RAMP_PER_S;
+    g_lift_control_debug.current_limit_start = LIFT_CURRENT_LIMIT_START;
+    g_lift_control_debug.current_limit_ramp_per_s =
+        LIFT_CURRENT_LIMIT_RAMP_PER_S;
+    g_lift_control_debug.speed_filter_tau_ms = LIFT_SPEED_FILTER_TAU_MS;
 
     /*
      * 找零：向下顶死点，再反方向退出。
@@ -1007,6 +1093,14 @@ static void lift_publish_status(
         top_status->control_effort_height;
     g_lift_control_status.error_height_ecd =
         top_status->control.error_height_ecd;
+    /* 平滑链的实时状态（按模态）：到位了为什么还有电流，先看这两个 */
+    for (ch = 0U; ch < (uint32_t)LIFT_CONTROL_MODE_COUNT; ch++)
+    {
+        g_lift_control_status.mode_hold_state[ch] =
+            top_status->control.hold_state[ch];
+        g_lift_control_status.mode_limit_open_current[ch] =
+            top_status->control.limit_open_current[ch];
+    }
 
     /*
      * 命令面允许的高度区间（模态量纲，含余量）。命令来源按它夹取，

@@ -8,6 +8,11 @@
 /* speed_rpm -> ecd/s 与 rpm -> deg/s 共用的换算常数：360 / 60。 */
 #define CONTROL_RPM_TO_DEG_S 6.0F
 
+/* 下面按"每个模态"跑同一套链，写全名太长，起三个短别名。 */
+#define MODE_HEIGHT LIFT_CONTROL_MODE_HEIGHT
+#define MODE_ROLL   LIFT_CONTROL_MODE_ROLL
+#define MODE_PITCH  LIFT_CONTROL_MODE_PITCH
+
 /** 取 32 位绝对值。 */
 static int32_t control_abs_i32(int32_t value)
 {
@@ -48,6 +53,175 @@ static int32_t control_f32_to_i32_sat(float value)
         return -2000000000;
     }
     return (int32_t)value;
+}
+
+/*
+ * ---- 平滑链的四个小工具（2026-10-11 从台架模块移植）--------------------
+ *
+ * 台架模块（lift_jog_task.c）在实机上调出来的一套"怎么让它丝滑到位"，
+ * 这里按模态复用同样的四个动作：斜坡速率、接近减速、逐级开放、电流斜坡。
+ */
+
+/**
+ * @brief 本周期目标斜坡的实际速率（模态 ecd/s），供跟踪前馈用。
+ * @note 斜坡关掉（step <= 0）时目标是一步到位的阶跃，速率算出来是"无穷大"
+ *       （host 实测 2e7 ecd/s），会把内环一拍拍到满电流 —— 所以必须返回 0。
+ */
+static int32_t control_ramp_rate(int32_t delta, int32_t step, float dt)
+{
+    if ((step <= 0) || (dt <= 0.0F))
+    {
+        return 0;
+    }
+    return control_f32_to_i32_sat((float)delta / dt);
+}
+
+/** 一阶低通一步：alpha = dt/(tau+dt)；alpha >= 1 时直通。 */
+static float control_low_pass(float previous, float input, float alpha)
+{
+    if (alpha >= 1.0F)
+    {
+        return input;
+    }
+    return previous + (alpha * (input - previous));
+}
+
+/** 限幅到 ±min(逐级开放上限, 硬限幅)；两个上限都为负时按 0。 */
+static int32_t control_clamp_i32(
+    int32_t value,
+    int32_t open_limit,
+    int32_t full_limit)
+{
+    int32_t limit = (open_limit < full_limit) ? open_limit : full_limit;
+
+    if (limit < 0)
+    {
+        limit = 0;
+    }
+    if (value > limit)
+    {
+        return limit;
+    }
+    if (value < -limit)
+    {
+        return -limit;
+    }
+    return value;
+}
+
+/*
+ * 逐级开放的电流上限：使能后从 current_limit_start 起步，按
+ * current_limit_ramp_per_s 放开到 full_limit。
+ *
+ * 为什么需要：一使能就给满电流，位置环还在零误差附近，机构会"窜一下"；
+ * 而且这是用户实测"空载大幅摆动"的解药之一。
+ *
+ * 顺序注意：**先返回本拍允许的值，再把下一拍推进**（反过来会让第一拍
+ * 就变成 start + rate·dt）。
+ */
+static int32_t control_open_limit(lift_control_t *self, uint32_t mode)
+{
+    const int32_t start = (self->config.current_limit_start > 0)
+        ? self->config.current_limit_start : 0;
+    const int32_t rate = (self->config.current_limit_ramp_per_s > 0)
+        ? self->config.current_limit_ramp_per_s : 0;
+    int32_t open = self->limit_open[mode];
+
+    if (rate <= 0)
+    {
+        /* 不逐级开放：直接用满限幅（由输出限幅那一层兜住） */
+        open = 2000000000;
+    }
+    if (open < start)
+    {
+        open = start;
+    }
+
+    self->limit_open[mode] = control_f32_to_i32_sat(
+        (float)open + ((float)rate * self->config.period_s));
+    return open;
+}
+
+/*
+ * 接近目标时的目标速度上限（模态 ecd/s）。返回 < 0 = 不减速。
+ *
+ *   |误差| >= approach_zone            → 不减速（用位置环自己的限幅）
+ *   deadband < |误差| < approach_zone  → 线性收窄到 approach_min_speed_ecd_s
+ *   |误差| <= deadband                 → 0（交给三态机刹停）
+ *
+ * ⚠️ 两个坑（都是台架 host 仿真抓出来的，别再踩）：
+ *   ① 收窄【电流上限】→ 机构停在半路推不过去（上限刚好等于重力+静摩擦）；
+ *   ② 速度指令一路收到 0 → 最后几十个计数推不动，卡在死区外进不去。
+ * 所以收窄的是速度指令，而且**只收到一个非零下限**。
+ */
+static int32_t control_approach_vmax(
+    const lift_control_config_t *config,
+    int32_t error,
+    int32_t deadband)
+{
+    const int32_t zone = config->approach_zone_ecd;
+    const int32_t magnitude = control_abs_i32(error);
+    const int32_t vmin = (config->approach_min_speed_ecd_s > 0)
+        ? config->approach_min_speed_ecd_s : 0;
+    const int32_t vmax = control_f32_to_i32_sat(
+        config->pid[LIFT_CONTROL_LOOP_POSITION].output_limit);
+
+    if ((zone <= 0) || (magnitude >= zone) || (zone <= deadband))
+    {
+        return -1;   /* 不减速 */
+    }
+    if (magnitude <= deadband)
+    {
+        return 0;    /* 刹停 */
+    }
+    if (vmax <= vmin)
+    {
+        return vmax;
+    }
+    return vmin + ((vmax - vmin) * (magnitude - deadband) / (zone - deadband));
+}
+
+/*
+ * 电流斜坡（di/dt 限幅）：把上一拍真正放出去的模态控制量朝目标挪一小步。
+ *
+ * 为什么主链也需要：这是"一给目标就一瞬间到 16000"的直接解药（护齿轮、护 C620）。
+ * ⚠️ 但它**不是越小越安全**：太小会让电流跟不上控制器的刹车请求，过冲反而更大
+ *    （台架实测 20000 → 过冲 18.8%，60000 → 1.9%）。两个方向都别调过头。
+ */
+static int32_t control_ramp_current(
+    lift_control_t *self,
+    uint32_t mode,
+    int32_t desired,
+    float dt)
+{
+    const float rate = (float)self->config.current_ramp_per_s;
+    float value = self->current_ramped[mode];
+
+    if ((rate <= 0.0F) || (dt <= 0.0F))
+    {
+        value = (float)desired;
+    }
+    else
+    {
+        const float step = rate * dt;
+        const float delta = (float)desired - value;
+
+        if (delta > step)
+        {
+            value += step;
+        }
+        else if (delta < -step)
+        {
+            value -= step;
+        }
+        else
+        {
+            value = (float)desired;
+        }
+    }
+
+    self->current_ramped[mode] = value;
+    return control_f32_to_i32_sat(value);
 }
 
 /** 取三者较小值。 */
@@ -327,6 +501,37 @@ void lift_control_init(lift_control_t *self, const lift_control_config_t *config
         self->config.feedforward_min_position_ecd =
             -self->config.feedforward_min_position_ecd;
     }
+    /* 平滑链的参数都是"大小"，取绝对值；0 有各自明确的含义（关/不开放） */
+    if (self->config.approach_zone_ecd < 0)
+    {
+        self->config.approach_zone_ecd = -self->config.approach_zone_ecd;
+    }
+    if (self->config.approach_min_speed_ecd_s < 0)
+    {
+        self->config.approach_min_speed_ecd_s =
+            -self->config.approach_min_speed_ecd_s;
+    }
+    if (self->config.hold_speed_ecd_s < 0)
+    {
+        self->config.hold_speed_ecd_s = -self->config.hold_speed_ecd_s;
+    }
+    if (self->config.current_ramp_per_s < 0)
+    {
+        self->config.current_ramp_per_s = -self->config.current_ramp_per_s;
+    }
+    if (self->config.current_limit_start < 0)
+    {
+        self->config.current_limit_start = -self->config.current_limit_start;
+    }
+    if (self->config.current_limit_ramp_per_s < 0)
+    {
+        self->config.current_limit_ramp_per_s =
+            -self->config.current_limit_ramp_per_s;
+    }
+    if (self->config.speed_filter_tau_ms < 0)
+    {
+        self->config.speed_filter_tau_ms = -self->config.speed_filter_tau_ms;
+    }
 
     /*
      * ---- 限幅区间规范化 ----
@@ -385,6 +590,13 @@ void lift_control_update(
     float position_output[LIFT_CONTROL_MODE_COUNT];
     float speed_output[LIFT_CONTROL_MODE_COUNT];
     int32_t target_speed[LIFT_CONTROL_MODE_COUNT];
+    int32_t actual[LIFT_CONTROL_MODE_COUNT];
+    int32_t ramped[LIFT_CONTROL_MODE_COUNT];
+    int32_t final_target[LIFT_CONTROL_MODE_COUNT];
+    int32_t ramp_rate[LIFT_CONTROL_MODE_COUNT];
+    int32_t pid_effort[LIFT_CONTROL_MODE_COUNT];
+    int32_t limit_now[LIFT_CONTROL_MODE_COUNT];
+    float limit_scale;
     uint32_t m;
     uint32_t ch;
 
@@ -402,6 +614,8 @@ void lift_control_update(
     {
         status->pid_output[LIFT_CONTROL_LOOP_POSITION][m] = 0.0F;
         status->pid_output[LIFT_CONTROL_LOOP_SPEED][m] = 0.0F;
+        status->hold_state[m] = (uint8_t)LIFT_CONTROL_HOLD_APPROACH;
+        status->limit_open_current[m] = 0;
     }
     status->target_speed_height = 0;
     status->target_speed_roll = 0;
@@ -468,97 +682,248 @@ void lift_control_update(
         return;
     }
 
-    /* 首次进入使能：斜坡吸附到当前位置，PID 从零积分起步。 */
+    /* 首次进入使能：斜坡吸附到当前位置，两环从零积分、斜坡缓存清零。 */
     if (!self->ramp_initialized)
     {
+        /*
+         * 速度反馈低通的状态吸附到【当前实测速度】，不是 0：
+         * 从 0 起步会让第一拍的低通输出只有真值的一小部分（α≈0.2 时只剩 1/5），
+         * 速度环于是以为"还没动"而多给一拍电流 —— 一个凭空的启动冲击。
+         * 同理电流斜坡缓存清 0：让保持电流也从 0 平滑加上去，而不是第一拍跳变。
+         */
         self->ramped_height_ecd = modes.height;
         self->ramped_roll_ecd = modes.roll;
         self->ramped_pitch_ecd = modes.pitch;
+        self->speed_filtered[LIFT_CONTROL_MODE_HEIGHT] = (float)modes_speed.height;
+        self->speed_filtered[LIFT_CONTROL_MODE_ROLL] = (float)modes_speed.roll;
+        self->speed_filtered[LIFT_CONTROL_MODE_PITCH] = (float)modes_speed.pitch;
+        for (m = 0U; m < (uint32_t)LIFT_CONTROL_MODE_COUNT; m++)
+        {
+            self->current_ramped[m] = 0.0F;
+            self->limit_open[m] = self->config.current_limit_start;
+            self->hold_state[m] = (uint8_t)LIFT_CONTROL_HOLD_APPROACH;
+        }
         self->ramp_initialized = true;
         control_reset_all_pid(self);
     }
 
-    self->ramped_height_ecd = control_ramp_toward(
-        self->ramped_height_ecd, command->target_height_ecd,
-        self->config.max_target_step_ecd);
-    self->ramped_roll_ecd = control_ramp_toward(
-        self->ramped_roll_ecd, command->target_roll_ecd,
-        self->config.max_target_step_ecd);
-    self->ramped_pitch_ecd = control_ramp_toward(
-        self->ramped_pitch_ecd, command->target_pitch_ecd,
-        self->config.max_target_step_ecd);
+    /* ---- ① 目标斜坡（同时算出本周期实际速率，供跟踪前馈）---- */
+    {
+        const int32_t step = self->config.max_target_step_ecd;
+        int32_t before;
 
-    /* 外环：模态位置误差 -> 目标模态速度。 */
-    position_output[LIFT_CONTROL_MODE_HEIGHT] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_POSITION][LIFT_CONTROL_MODE_HEIGHT],
-        (float)self->ramped_height_ecd, (float)modes.height,
-        self->config.period_s);
-    position_output[LIFT_CONTROL_MODE_ROLL] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_POSITION][LIFT_CONTROL_MODE_ROLL],
-        (float)self->ramped_roll_ecd, (float)modes.roll,
-        self->config.period_s);
-    position_output[LIFT_CONTROL_MODE_PITCH] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_POSITION][LIFT_CONTROL_MODE_PITCH],
-        (float)self->ramped_pitch_ecd, (float)modes.pitch,
-        self->config.period_s);
+        before = self->ramped_height_ecd;
+        self->ramped_height_ecd = control_ramp_toward(
+            before, command->target_height_ecd, step);
+        ramp_rate[LIFT_CONTROL_MODE_HEIGHT] = control_ramp_rate(
+            self->ramped_height_ecd - before, step, self->config.period_s);
 
-    target_speed[LIFT_CONTROL_MODE_HEIGHT] =
-        control_f32_to_i32_sat(position_output[LIFT_CONTROL_MODE_HEIGHT]);
-    target_speed[LIFT_CONTROL_MODE_ROLL] =
-        control_f32_to_i32_sat(position_output[LIFT_CONTROL_MODE_ROLL]);
-    target_speed[LIFT_CONTROL_MODE_PITCH] =
-        control_f32_to_i32_sat(position_output[LIFT_CONTROL_MODE_PITCH]);
+        before = self->ramped_roll_ecd;
+        self->ramped_roll_ecd = control_ramp_toward(
+            before, command->target_roll_ecd, step);
+        ramp_rate[LIFT_CONTROL_MODE_ROLL] = control_ramp_rate(
+            self->ramped_roll_ecd - before, step, self->config.period_s);
 
-    /* 内环：模态速度误差 -> 模态控制量。 */
-    speed_output[LIFT_CONTROL_MODE_HEIGHT] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_SPEED][LIFT_CONTROL_MODE_HEIGHT],
-        (float)target_speed[LIFT_CONTROL_MODE_HEIGHT],
-        (float)modes_speed.height,
-        self->config.period_s);
-    speed_output[LIFT_CONTROL_MODE_ROLL] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_SPEED][LIFT_CONTROL_MODE_ROLL],
-        (float)target_speed[LIFT_CONTROL_MODE_ROLL],
-        (float)modes_speed.roll,
-        self->config.period_s);
-    speed_output[LIFT_CONTROL_MODE_PITCH] = pid_calculate(
-        &self->pid[LIFT_CONTROL_LOOP_SPEED][LIFT_CONTROL_MODE_PITCH],
-        (float)target_speed[LIFT_CONTROL_MODE_PITCH],
-        (float)modes_speed.pitch,
-        self->config.period_s);
+        before = self->ramped_pitch_ecd;
+        self->ramped_pitch_ecd = control_ramp_toward(
+            before, command->target_pitch_ecd, step);
+        ramp_rate[LIFT_CONTROL_MODE_PITCH] = control_ramp_rate(
+            self->ramped_pitch_ecd - before, step, self->config.period_s);
+    }
 
-    effort->height = control_f32_to_i32_sat(speed_output[LIFT_CONTROL_MODE_HEIGHT]);
-    effort->roll = control_f32_to_i32_sat(speed_output[LIFT_CONTROL_MODE_ROLL]);
-    effort->pitch = control_f32_to_i32_sat(speed_output[LIFT_CONTROL_MODE_PITCH]);
+    /* ---- 模态量装进数组，下面按模态跑同一套链 ---- */
+    actual[MODE_HEIGHT] = modes.height;
+    actual[MODE_ROLL] = modes.roll;
+    actual[MODE_PITCH] = modes.pitch;
+    final_target[MODE_HEIGHT] = command->target_height_ecd;
+    final_target[MODE_ROLL] = command->target_roll_ecd;
+    final_target[MODE_PITCH] = command->target_pitch_ecd;
+    ramped[MODE_HEIGHT] = self->ramped_height_ecd;
+    ramped[MODE_ROLL] = self->ramped_roll_ecd;
+    ramped[MODE_PITCH] = self->ramped_pitch_ecd;
 
     /*
-     * ---- 模态限幅 ----
+     * 前馈只加在高度模态（重力是单向的；横滚/俯仰没有恒定偏载），
+     * 并且统一在下面的限幅块里加 —— 这样它既参与模态限幅的比例计算，
+     * 也受逐级开放与电流上限约束。分装在各状态分支里加过一次就重复了。
+     */
+
+    /* 速度反馈一阶低通（C620 的 rpm 是整数，1 rpm 台阶在内环会被放大） */
+    {
+        const float tau_s = (float)self->config.speed_filter_tau_ms / 1000.0F;
+        const float alpha = (tau_s > 0.0F)
+            ? (self->config.period_s / (tau_s + self->config.period_s)) : 1.0F;
+
+        self->speed_filtered[MODE_HEIGHT] = control_low_pass(
+            self->speed_filtered[MODE_HEIGHT], (float)modes_speed.height, alpha);
+        self->speed_filtered[MODE_ROLL] = control_low_pass(
+            self->speed_filtered[MODE_ROLL], (float)modes_speed.roll, alpha);
+        self->speed_filtered[MODE_PITCH] = control_low_pass(
+            self->speed_filtered[MODE_PITCH], (float)modes_speed.pitch, alpha);
+    }
+
+    /*
+     * ---- ②③④ 每个模态：位置环 → 减速区 → 跟踪前馈 → 状态机 → 速度环 ----
      *
-     * 把前馈并入之后再统一算比例 s，使得"控制量 + 前馈"这个实际下发的量
-     * 不会让任何一根轴越过行程。前馈也参与限幅，否则它自己就能把轴推过界。
+     * 这一段与台架模块（lift_jog_task.c 的 lift_test_cascade_axis）同构，
+     * 只是把"每根轴"换成"每个模态"。台架那套是 host 仿真 + 实机验证过的，
+     * 搬过来的理由逐条写在配置结构（lift_control_config_t）里。
+     */
+    for (m = 0U; m < (uint32_t)LIFT_CONTROL_MODE_COUNT; m++)
+    {
+        const int32_t deadband = self->config.settle_tolerance_ecd;
+        const int32_t error = ramped[m] - actual[m];
+        const int32_t speed = control_f32_to_i32_sat(self->speed_filtered[m]);
+        const bool settled = (ramped[m] == final_target[m]);
+        int32_t value;
+
+        /* 逐级开放的电流上限（先取本拍的值，再推进下一拍） */
+        limit_now[m] = control_open_limit(self, m);
+
+        /*
+         * 三态机：APPROACH / BRAKE / HOLD。
+         *
+         * ⚠️ 转 BRAKE 必须同时满足 target_settled（斜坡走到头）：
+         * 目标还在斜坡上时位置误差本来就只有几十计数（跟踪前馈压住了），
+         * 只看误差就刹车会变成"目标还在走、车却停了"的抖振。
+         */
+        if ((control_abs_i32(error) > deadband) || !settled)
+        {
+            if (self->hold_state[m] != (uint8_t)LIFT_CONTROL_HOLD_APPROACH)
+            {
+                /*
+                 * 从 BRAKE/HOLD 退回 APPROACH：先清两条环的历史。
+                 * HOLD 期间根本没调用 PID，previous_error 还是进去之前那一拍的，
+                 * 直接接着算微分会得到一个巨大的假导数（退出瞬间踢一脚）。
+                 */
+                pid_reset(&self->pid[LIFT_CONTROL_LOOP_POSITION][m]);
+                pid_reset(&self->pid[LIFT_CONTROL_LOOP_SPEED][m]);
+            }
+            self->hold_state[m] = (uint8_t)LIFT_CONTROL_HOLD_APPROACH;
+        }
+        else if (self->hold_state[m] == (uint8_t)LIFT_CONTROL_HOLD_APPROACH)
+        {
+            self->hold_state[m] = (uint8_t)LIFT_CONTROL_HOLD_BRAKE;
+        }
+
+        if ((self->hold_state[m] == (uint8_t)LIFT_CONTROL_HOLD_BRAKE) &&
+            (self->config.hold_speed_ecd_s > 0) &&
+            (control_abs_i32(speed) <= self->config.hold_speed_ecd_s))
+        {
+            self->hold_state[m] = (uint8_t)LIFT_CONTROL_HOLD_HOLD;
+        }
+
+        if (self->hold_state[m] == (uint8_t)LIFT_CONTROL_HOLD_HOLD)
+        {
+            /*
+             * HOLD：两条环退出，只给保持前馈把车托住。
+             * 本机构不自锁，这一项是 0 就会自己落下去（除非车压在最低端，
+             * 那时前馈本身被 feedforward_min_position_ecd 关掉）。
+             *
+             * 注意这里 pid_effort 只装【PID 那一份】= 0；前馈由下面的限幅块
+             * 统一加（那里还要参与模态限幅与电流上限），不能在这儿重复加。
+             */
+            position_output[m] = 0.0F;
+            speed_output[m] = 0.0F;
+            target_speed[m] = 0;
+            value = 0;
+        }
+        else if (self->hold_state[m] == (uint8_t)LIFT_CONTROL_HOLD_BRAKE)
+        {
+            /* 刹车：速度指令强制 0，让速度环主动把速度拉下来（不是断力） */
+            position_output[m] = 0.0F;
+            target_speed[m] = 0;
+            speed_output[m] = pid_calculate(
+                &self->pid[LIFT_CONTROL_LOOP_SPEED][m], 0.0F,
+                self->speed_filtered[m], self->config.period_s);
+            value = control_f32_to_i32_sat(speed_output[m]);
+        }
+        else
+        {
+            const int32_t approach_vmax =
+                control_approach_vmax(&self->config, error, deadband);
+
+            position_output[m] = pid_calculate(
+                &self->pid[LIFT_CONTROL_LOOP_POSITION][m],
+                (float)ramped[m], (float)actual[m], self->config.period_s);
+            target_speed[m] = control_f32_to_i32_sat(position_output[m]);
+
+            /* 减速区：只压上限，而且**只压到非零下限**（收到 0 会卡在死区外） */
+            if (approach_vmax >= 0)
+            {
+                if (target_speed[m] > approach_vmax)
+                {
+                    target_speed[m] = approach_vmax;
+                }
+                else if (target_speed[m] < -approach_vmax)
+                {
+                    target_speed[m] = -approach_vmax;
+                }
+            }
+
+            /*
+             * ★ 跟踪前馈：目标以速率 R 走时，理想速度指令就是 R。
+             * 不给它，位置环必须靠"攒出 R/kp 的误差"才能命令出 R —— 那就是
+             * 跟踪滞后，误差一直存在、积分一直往外顶。
+             * 放在减速收窄【之后】，所以前馈不会被收窄砍掉（与台架同序）。
+             */
+            target_speed[m] += ramp_rate[m];
+
+            speed_output[m] = pid_calculate(
+                &self->pid[LIFT_CONTROL_LOOP_SPEED][m],
+                (float)target_speed[m], self->speed_filtered[m],
+                self->config.period_s);
+            value = control_f32_to_i32_sat(speed_output[m]);
+        }
+
+        pid_effort[m] = value;
+    }
+
+    /* 交给模态限幅的"控制量"（前馈已含在内，与限幅比例一起算） */
+    {
+        lift_sync_effort_t combined;
+
+        combined.height = pid_effort[MODE_HEIGHT];
+        combined.roll = pid_effort[MODE_ROLL];
+        combined.pitch = pid_effort[MODE_PITCH];
+        limit_scale = control_limit_scale(
+            &self->config, position, &combined, &feedforward);
+    }
+
+    /*
+     * ---- ⑤ 模态限幅 + 逐级开放限幅 + 电流斜坡 ----
      *
-     * 比例 s 由【控制量 + 前馈】的合成量算出（见 control_limit_scale），
-     * 但最终只乘在 PID 控制量上：
-     *      最终 = 控制量 × s + 前馈
-     *
-     * 前馈【故意不被 s 压掉】：它是"托住车"的静态力。车停在上限附近时正要
-     * 靠它保持高度，若把它一起压成 0，车会直接掉下来（本机构不自锁）。
-     * 而"到界了还继续往上顶"这件事由控制量那一项被压成 0 来阻止——
-     * 前馈是静态保持力，不会随周期累积成越界位移。
+     * 模态限幅只压 PID 那一部分（前馈是静态保持力，压掉车会掉）；
+     * 逐级开放与硬上限压在【合成之后】的量上，所以保持电流也受它管；
+     * 电流斜坡最后做，保证任何情况下进 CAN 的 di/dt 都是受控的。
      */
     {
-        const float limit_scale = control_limit_scale(
-            &self->config, position, effort, &feedforward);
+        const float full_limit =
+            self->config.pid[LIFT_CONTROL_LOOP_SPEED].output_limit;
+        int32_t value;
 
-        effort->height = control_f32_to_i32_sat(
-            (float)effort->height * limit_scale + (float)feedforward.height);
-        effort->roll = control_f32_to_i32_sat(
-            (float)effort->roll * limit_scale + (float)feedforward.roll);
-        effort->pitch = control_f32_to_i32_sat(
-            (float)effort->pitch * limit_scale + (float)feedforward.pitch);
+        value = control_f32_to_i32_sat(
+            (float)pid_effort[MODE_HEIGHT] * limit_scale +
+            (float)feedforward.height);
+        value = control_clamp_i32(value, limit_now[MODE_HEIGHT], full_limit);
+        effort->height = control_ramp_current(
+            self, MODE_HEIGHT, value, self->config.period_s);
 
-        status->limit_scale = limit_scale;
-        status->limit_active = (limit_scale < 0.999F);
+        value = control_f32_to_i32_sat(
+            (float)pid_effort[MODE_ROLL] * limit_scale);
+        value = control_clamp_i32(value, limit_now[MODE_ROLL], full_limit);
+        effort->roll = control_ramp_current(
+            self, MODE_ROLL, value, self->config.period_s);
+
+        value = control_f32_to_i32_sat(
+            (float)pid_effort[MODE_PITCH] * limit_scale);
+        value = control_clamp_i32(value, limit_now[MODE_PITCH], full_limit);
+        effort->pitch = control_ramp_current(
+            self, MODE_PITCH, value, self->config.period_s);
     }
+
+    status->limit_scale = limit_scale;
+    status->limit_active = (limit_scale < 0.999F);
 
     status->ramped_height_ecd = self->ramped_height_ecd;
     status->ramped_roll_ecd = self->ramped_roll_ecd;
@@ -573,6 +938,8 @@ void lift_control_update(
     {
         status->pid_output[LIFT_CONTROL_LOOP_POSITION][m] = position_output[m];
         status->pid_output[LIFT_CONTROL_LOOP_SPEED][m] = speed_output[m];
+        status->hold_state[m] = self->hold_state[m];
+        status->limit_open_current[m] = limit_now[m];
     }
 
     status->at_target =

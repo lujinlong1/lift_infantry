@@ -76,6 +76,19 @@ typedef enum
     LIFT_CONTROL_LOOP_COUNT
 } lift_control_loop_t;
 
+/*
+ * 每个模态的三态（2026-10-11 从台架模块移植）：
+ *   APPROACH  正常串级，目标速度按距离收窄
+ *   BRAKE     进死区但还在动：目标速度强制 0，让速度环主动拉停（不是断力）
+ *   HOLD      进死区且停住：两条环退出，只留保持前馈把车托住
+ */
+typedef enum
+{
+    LIFT_CONTROL_HOLD_APPROACH = 0,
+    LIFT_CONTROL_HOLD_BRAKE,
+    LIFT_CONTROL_HOLD_HOLD
+} lift_control_hold_state_t;
+
 typedef struct
 {
     /*
@@ -175,6 +188,34 @@ typedef struct
     int32_t feedforward_min_position_ecd;
 
     /*
+     * ---- 平滑链（2026-10-11 从台架模块移植，五个环节）------------------
+     *
+     * 台架模块（Diagnostics/MotorTest/lift_jog_task.c）在实机上调出来的那套
+     * "怎么让 M3508 丝滑到位"，本来只有台架有；主链只有"位置环+速度环+目标斜坡"，
+     * 所以同样的机构在主链上会冲、会欠阻尼。这里把缺的五个搬进来：
+     *
+     *   ① 跟踪前馈     目标以速率 R 走时，速度指令直接加 R（否则要靠误差去攒，
+     *                  斜坡期间一直有跟踪滞后，位置环积分一直往外顶）
+     *   ② 接近减速     误差进入 approach_zone 后把【目标速度】线性收窄，
+     *                  但只收到 approach_min_speed_ecd_s（收到 0 会卡在死区外）
+     *   ③ 三态机       APPROACH / BRAKE / HOLD：到位后不是靠 PID 微振，
+     *                  而是刹停→只给保持前馈
+     *   ④ 逐级开放     使能后电流上限从 current_limit_start 慢慢放开
+     *   ⑤ 电流斜坡     di/dt 限幅，防"一瞬间到满电流"（护齿轮/护 C620）
+     *   另加：速度反馈一阶低通（C620 的 rpm 是整数，1 rpm 台阶会被内环放大）
+     *
+     * 全部按【模态】给（三个模态共用同一组数），量纲是模态计数/模态 ecd/s。
+     * 想换算到单轴：÷ LIFT_CHANNEL_COUNT（= 4）。
+     */
+    int32_t approach_zone_ecd;          /* 减速区起点；<=0 = 不减速 */
+    int32_t approach_min_speed_ecd_s;   /* 减速区最低目标速度；0 会卡在死区外，别填 0 */
+    int32_t hold_speed_ecd_s;           /* 判定"停住了"的模态速度阈值；<=0 = 不进 HOLD */
+    int32_t current_ramp_per_s;         /* 模态控制量的 di/dt；0 = 不限制 */
+    int32_t current_limit_start;        /* 逐级开放起点；0 = 从头就是满限幅 */
+    int32_t current_limit_ramp_per_s;   /* 逐级开放速度；0 = 不逐级开放 */
+    int32_t speed_filter_tau_ms;        /* 速度反馈一阶低通时间常数；0 = 关 */
+
+    /*
      * ---- 执行器增益（模态限幅预测位移时必需）------------------------
      *
      * 单位：(单轴 ecd/s) 每 电流。也就是"给 1 个电流单位，丝杆最终跑多快"，
@@ -220,6 +261,10 @@ typedef struct
     float limit_scale;
     bool  limit_active;
     bool  at_target;                    /* 三个模态误差都在容差内 */
+    /* 每个模态的三态（见 lift_control_hold_state_t）：调"到位后为什么还在动"看它 */
+    uint8_t hold_state[LIFT_CONTROL_MODE_COUNT];
+    /* 本周期实际生效的逐级开放电流上限（模态量纲） */
+    int32_t limit_open_current[LIFT_CONTROL_MODE_COUNT];
 } lift_control_status_t;
 
 typedef struct
@@ -230,6 +275,11 @@ typedef struct
     int32_t ramped_roll_ecd;
     int32_t ramped_pitch_ecd;
     bool ramp_initialized;
+    /* 平滑链的状态（按模态） */
+    float speed_filtered[LIFT_CONTROL_MODE_COUNT];   /* 速度低通 */
+    float current_ramped[LIFT_CONTROL_MODE_COUNT];   /* 电流斜坡缓存 */
+    int32_t limit_open[LIFT_CONTROL_MODE_COUNT];     /* 逐级开放已放到多少 */
+    uint8_t hold_state[LIFT_CONTROL_MODE_COUNT];     /* 三态机 */
 } lift_control_t;
 
 /* 初始化：填入默认 PID 参数与矩形布局，清空斜坡状态。config 为 NULL 时不修改。 */
