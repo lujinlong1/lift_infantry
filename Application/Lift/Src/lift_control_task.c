@@ -1,6 +1,7 @@
 #include "lift_control_task.h"
 
 #include "bsp_can.h"
+#include "chassis_control.h"
 #include "cmsis_os2.h"
 #include "dji_motor.h"
 #include "FreeRTOS.h"
@@ -1446,19 +1447,190 @@ static void lift_publish_status(
 }
 
 static bool lift_test_start_pending;
+static bool lift_stair_start_pending;
+static bool lift_stair_owned;
+static int32_t stair_distance[3], stair_speed[3];
+static int32_t stair_previous_ecd[4];
+static int8_t stair_direction[4];
+static float stair_counts_per_mm;
+static float stair_progress, stair_last_progress, stair_velocity;
+static int8_t stair_leg = -1;
+static uint32_t stair_motion_tick, stair_settle_tick;
+static bool stair_settling;
+
+/* Called before the sequence update. Completion belongs only to the current
+ * leg; pauses retain wheel progress, including coasting while paused. */
+static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
+{
+    const lift_seq_state_t stage = g_lift_sequence.state;
+    const int8_t leg = stage == LIFT_SEQ_STATE_APPROACH_STEP ? 0 :
+        stage == LIFT_SEQ_STATE_ADVANCE_MIDDLE ? 1 :
+        stage == LIFT_SEQ_STATE_FINAL_ADVANCE ? 2 : -1;
+    bool stationary = true;
+    float increment = 0.0F;
+    uint32_t ch;
+    if (!lift_stair_owned) return false;
+    chassis_control_stair_velocity(0.0F);
+    if (g_dji_can_test_status.running || g_dji_can_test_status.zero_holding ||
+        g_lift_jog_status.running || !lift_configuration_applied ||
+        lift_last_status.fault != LIFT_TOP_FAULT_NONE)
+    {
+        g_lift_control_debug.test_pause = true;
+        stair_velocity = 0.0F;
+        return false;
+    }
+    if (g_lift_control_debug.stair_drive_release)
+    {
+        g_lift_control_debug.stair_drive_release = false;
+        if (stage == LIFT_SEQ_STATE_IDLE || stage == LIFT_SEQ_STATE_COMPLETE)
+        {
+            chassis_control_stair_release();
+            lift_stair_owned = false;
+            return false;
+        }
+    }
+    if (leg >= 0 && leg != stair_leg)
+    {
+        stair_leg = leg;
+        stair_progress = stair_last_progress = stair_velocity = 0.0F;
+        stair_motion_tick = now;
+        stair_settling = false;
+        for (ch = 0U; ch < 4U; ch++)
+            stair_previous_ecd[ch] = motors->chassis.wheel[ch].total_ecd;
+    }
+    for (ch = 0U; ch < 4U; ch++)
+    {
+        const dji_motor_feedback_t *m = &motors->chassis.wheel[ch];
+        if (!dji_motor_feedback_is_online(m, now,
+                pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS)))
+        {
+            g_lift_control_debug.stair_drive_stop_reason = 1U;
+            g_lift_control_debug.test_pause = true;
+            stair_velocity = 0.0F;
+            return false;
+        }
+        if (m->speed_rpm > 2 || m->speed_rpm < -2) stationary = false;
+        if (stair_leg >= 0)
+        {
+            /* Unsigned subtraction avoids UB across encoder counter wrap. */
+            const int32_t delta = (int32_t)((uint32_t)m->total_ecd -
+                (uint32_t)stair_previous_ecd[ch]);
+            increment += (float)delta * (float)stair_direction[ch];
+            stair_previous_ecd[ch] = m->total_ecd;
+        }
+    }
+    if (stair_leg >= 0) stair_progress += increment / (4.0F * stair_counts_per_mm);
+    g_lift_control_debug.stair_drive_progress_mm = (int32_t)stair_progress;
+    g_lift_control_debug.stair_drive_leg = leg;
+    if (leg < 0 || g_lift_control_debug.test_pause ||
+        g_lift_control_debug.sequence_abort)
+    {
+        stair_velocity = 0.0F;
+        stair_motion_tick = now;
+        stair_last_progress = stair_progress;
+        stair_settling = false;
+        return false;
+    }
+    if (stair_progress < -10.0F)
+    {
+        g_lift_control_debug.stair_drive_stop_reason = 3U;
+        g_lift_control_debug.test_pause = true;
+        stair_velocity = 0.0F;
+        return false;
+    }
+    if (stair_progress >= (float)stair_distance[leg])
+    {
+        stair_velocity = 0.0F;
+        if (!stationary) stair_settling = false;
+        else if (!stair_settling) { stair_settling = true; stair_settle_tick = now; }
+        return stair_settling && (uint32_t)(now - stair_settle_tick) >= 100U;
+    }
+    if (stair_progress - stair_last_progress >= 2.0F)
+    {
+        stair_last_progress = stair_progress;
+        stair_motion_tick = now;
+    }
+    else if ((uint32_t)(now - stair_motion_tick) >= 2000U)
+    {
+        g_lift_control_debug.stair_drive_stop_reason = 2U;
+        g_lift_control_debug.test_pause = true;
+        stair_velocity = 0.0F;
+        return false;
+    }
+    {
+        float desired = ((float)stair_distance[leg] - stair_progress) * 2.0F;
+        if (desired < 10.0F) desired = 10.0F;
+        if (desired > (float)stair_speed[leg]) desired = (float)stair_speed[leg];
+        if (stair_velocity < desired) stair_velocity += 0.5F; /* 100 mm/s2 @5ms */
+        if (stair_velocity > desired) stair_velocity = desired;
+        chassis_control_stair_velocity(stair_velocity * 0.001F);
+    }
+    return false;
+}
 
 static void lift_handle_test_start(bool bench_owns)
 {
     bool requested;
+    bool stair_requested;
     int32_t height_mm;
     const bool was_pending = lift_test_start_pending;
     taskENTER_CRITICAL();
     requested = g_lift_control_debug.test_start;
+    stair_requested = g_lift_control_debug.stair_start;
     height_mm = g_lift_control_debug.test_height_mm;
     g_lift_control_debug.test_start = false;
+    g_lift_control_debug.stair_start = false;
     taskEXIT_CRITICAL();
-    if (!requested && !lift_test_start_pending) return;
+    if (!requested && !stair_requested && !lift_test_start_pending) return;
+    if (requested && stair_requested)
+    {
+        g_lift_control_debug.test_start_result = 3U;
+        return;
+    }
+    if (was_pending) stair_requested = lift_stair_start_pending;
     lift_test_start_pending = false;
+    lift_stair_start_pending = false;
+    if (stair_requested)
+    {
+        robot_motor_state_t start_motors;
+        uint32_t ch;
+        const float rpm_per_mps = g_chassis_control_debug.rpm_per_mps;
+        if (!(rpm_per_mps > 0.0F && rpm_per_mps < 100000.0F) ||
+            g_lift_control_debug.stair_retracted_mm < 0 ||
+            g_lift_control_debug.stair_retracted_mm >= height_mm ||
+            g_lift_control_debug.stair_contact_mm < g_lift_control_debug.stair_retracted_mm ||
+            g_lift_control_debug.stair_contact_mm > height_mm)
+        {
+            g_lift_control_debug.test_start_result = 8U;
+            return;
+        }
+        for (ch = 0U; ch < 3U; ch++)
+            if (g_lift_control_debug.stair_distance_mm[ch] < 1 ||
+                g_lift_control_debug.stair_distance_mm[ch] > 2000 ||
+                g_lift_control_debug.stair_speed_mm_s[ch] < 10 ||
+                g_lift_control_debug.stair_speed_mm_s[ch] > 200)
+            {
+                g_lift_control_debug.test_start_result = 8U;
+                return;
+            }
+        for (ch = 0U; ch < 4U; ch++)
+            if (g_chassis_control_debug.motor_direction[ch] != 1 &&
+                g_chassis_control_debug.motor_direction[ch] != -1)
+            {
+                g_lift_control_debug.test_start_result = 8U;
+                return;
+            }
+        robot_motors_get_snapshot(&start_motors);
+        for (ch = 0U; ch < 4U; ch++)
+            if (!dji_motor_feedback_is_online(&start_motors.chassis.wheel[ch],
+                osKernelGetTickCount(), pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS)) ||
+                start_motors.chassis.wheel[ch].speed_rpm > 2 ||
+                start_motors.chassis.wheel[ch].speed_rpm < -2)
+            {
+                g_lift_control_debug.test_start_result = 9U;
+                return;
+            }
+    }
     if (height_mm < 9 || height_mm > 200)
     {
         g_lift_control_debug.test_start_result = 6U;
@@ -1528,6 +1700,7 @@ static void lift_handle_test_start(bool bench_owns)
         g_lift_control_debug.sequence_reset = true;
         g_lift_task_command.reset_request = true;
         lift_test_start_pending = true;
+        lift_stair_start_pending = stair_requested;
         g_lift_control_debug.test_start_result = 1U;
         return;
     }
@@ -1561,9 +1734,30 @@ static void lift_handle_test_start(bool bench_owns)
         lift_top_reload_control(&lift_top, &travel_config);
         lift_build_kinematics(&travel_debug);
     }
-    g_lift_sequence.config.lift_test_only = true;
-    g_lift_sequence.config.contact_mm = 8;
-    g_lift_sequence.config.retracted_mm = 2;
+    g_lift_sequence.config.lift_test_only = !stair_requested;
+    g_lift_sequence.config.stair_debug_run = stair_requested;
+    g_lift_sequence.config.contact_mm = stair_requested ?
+        g_lift_control_debug.stair_contact_mm : 8;
+    g_lift_sequence.config.retracted_mm = stair_requested ?
+        g_lift_control_debug.stair_retracted_mm : 2;
+    if (stair_requested)
+    {
+        uint32_t ch;
+        for (ch = 0U; ch < 3U; ch++)
+        {
+            stair_distance[ch] = g_lift_control_debug.stair_distance_mm[ch];
+            stair_speed[ch] = g_lift_control_debug.stair_speed_mm_s[ch];
+        }
+        for (ch = 0U; ch < 4U; ch++)
+            stair_direction[ch] = g_chassis_control_debug.motor_direction[ch];
+        stair_counts_per_mm = 8192.0F * g_chassis_control_debug.rpm_per_mps / 60000.0F;
+        stair_leg = -1;
+        stair_progress = 0.0F;
+        g_lift_control_debug.stair_drive_stop_reason = 0U;
+        g_lift_control_debug.stair_retracted_mask = 0U;
+        lift_stair_owned = true;
+        chassis_control_stair_velocity(0.0F);
+    }
     /* This machine's front=ch0/ch1, rear=ch2/ch3 is physically confirmed. */
     g_lift_control_debug.sequence_layout_confirmed = true;
     g_lift_control_debug.sequence_drive_done = false;
@@ -1688,7 +1882,9 @@ static void lift_control_task(void *argument)
             sin.layout_confirmed = g_lift_control_debug.sequence_layout_confirmed;
             sin.guard_fault = (lift_last_status.guard_state ==
                                LIFT_GUARD_STATE_FAULT);
-            sin.drive_done = g_lift_control_debug.sequence_drive_done;
+            sin.drive_done = lift_stair_drive(&motors, now) ||
+                g_lift_control_debug.sequence_drive_done;
+            g_lift_control_debug.sequence_drive_done = false;
             sin.contact_front = g_lift_control_debug.sequence_contact_front;
             sin.contact_rear = g_lift_control_debug.sequence_contact_rear;
             sin.sync_error_mm = g_lift_control_status.sync_error_mm;
@@ -1768,6 +1964,9 @@ static void lift_control_task(void *argument)
             taskEXIT_CRITICAL();
 
             lift_seq_update(&g_lift_sequence, &sin, &sst);
+            if (lift_stair_owned && (sst.state != stage_before || bench_owns ||
+                lift_last_status.fault != LIFT_TOP_FAULT_NONE))
+                chassis_control_stair_velocity(0.0F);
             if (stage_before != LIFT_SEQ_STATE_TEST_PAUSED &&
                 sst.state == LIFT_SEQ_STATE_TEST_PAUSED)
             {
@@ -1919,6 +2118,25 @@ static void lift_control_task(void *argument)
                 for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
                 {
                     applied[ch] = top_status.output_current[ch];
+                    if (lift_stair_owned && g_lift_sequence.config.stair_debug_run)
+                    {
+                        const lift_seq_state_t stage = g_lift_sequence.state;
+                        const bool retracting_front = stage >= LIFT_SEQ_STATE_RETRACT_FRONT &&
+                            stage <= LIFT_SEQ_STATE_COMPLETE &&
+                            (ROBOT_LIFT_FRONT_MASK & (1U << ch)) != 0U;
+                        const bool retracting_rear = stage >= LIFT_SEQ_STATE_RETRACT_REAR &&
+                            stage <= LIFT_SEQ_STATE_COMPLETE &&
+                            (ROBOT_LIFT_REAR_MASK & (1U << ch)) != 0U;
+                        int32_t mm;
+                        const int32_t pose = lift_top.config.axis_direction[ch] *
+                            (input.position_ecd[ch] - lift_top.zero_ecd[ch]);
+                        if ((retracting_front || retracting_rear) &&
+                            lift_kin_ecd_to_mm(&lift_kin, ch, pose, &mm) &&
+                            mm >= -1 && mm <= g_lift_sequence.config.retracted_mm + 1)
+                            g_lift_control_debug.stair_retracted_mask |= (uint8_t)(1U << ch);
+                        if ((g_lift_control_debug.stair_retracted_mask & (1U << ch)) != 0U)
+                            applied[ch] = 0;
+                    }
                 }
             }
 
@@ -1991,6 +2209,14 @@ void lift_control_task_init(void)
 
     lift_set_default_debug();
     lift_test_start_pending = false;
+    lift_stair_start_pending = false;
+    lift_stair_owned = false;
+    stair_leg = -1;
+    g_lift_control_debug.stair_drive_leg = -1;
+    g_lift_control_debug.stair_contact_mm = 8;
+    g_lift_control_debug.stair_retracted_mm = 2;
+    for (uint32_t ch = 0U; ch < 3U; ch++)
+        g_lift_control_debug.stair_speed_mm_s[ch] = 50;
     g_lift_control_debug.test_height_mm = 50;
     g_lift_control_debug.test_auto_zero = true;
     g_lift_control_debug.test_extend_travel = true;

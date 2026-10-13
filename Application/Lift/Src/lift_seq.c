@@ -839,7 +839,33 @@ void lift_seq_update(
      */
     state_at_entry = self->state;
 
-    if (self->config.lift_test_only)
+    if (self->config.stair_debug_run && !self->config.lift_test_only)
+    {
+        if (in->test_pause_request && self->state != LIFT_SEQ_STATE_TEST_PAUSED &&
+            self->state != LIFT_SEQ_STATE_COMPLETE)
+        {
+            self->test_resume_state = self->state;
+            self->stair_resume_elapsed_ms = in->now_ms - self->step_start_ms;
+            self->test_stall_axis = -1;
+            for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+            {
+                self->stair_resume_mm[ch] = self->axis_target_mm[ch];
+                self->test_pause_ecd[ch] = in->position_ecd[ch];
+                self->axis_target_mm[ch] = in->position_mm[ch];
+            }
+            self->targets_valid = true;
+            seq_enter(self, LIFT_SEQ_STATE_TEST_PAUSED, in->now_ms);
+        }
+        else if (self->state == LIFT_SEQ_STATE_TEST_PAUSED && in->test_resume_request)
+        {
+            for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+                self->axis_target_mm[ch] = self->stair_resume_mm[ch];
+            seq_enter(self, self->test_resume_state, in->now_ms);
+            self->step_start_ms = in->now_ms - self->stair_resume_elapsed_ms;
+            self->test_stall_axis = -1;
+        }
+    }
+    else if (self->config.lift_test_only)
     {
         const bool test_controllable =
             self->state == LIFT_SEQ_STATE_LIFT_CLEARANCE ||
@@ -1314,8 +1340,10 @@ void lift_seq_update(
             self->state == LIFT_SEQ_STATE_TEST_PARKED ?
             "low position - still powered, verify mechanical support" :
             "lift test holding - pause/resume/lower only";
-        if (in->sync_error_mm > self->config.max_sync_error_mm ||
-            in->deviation_max_mm > self->config.max_deviation_mm)
+        if (self->config.stair_debug_run ?
+            (in->tracking_deviation_valid && in->tracking_deviation_mm > self->config.max_deviation_mm) :
+            (in->sync_error_mm > self->config.max_sync_error_mm ||
+             in->deviation_max_mm > self->config.max_deviation_mm))
         {
             if (seq_settle_elapsed(self, in, true, SEQ_TILT_SETTLE_MS))
             {
@@ -1362,16 +1390,18 @@ void lift_seq_update(
 
         if (stalled >= 0)
         {
-            if (self->config.lift_test_only)
+            if (self->config.lift_test_only || self->config.stair_debug_run)
             {
                 self->test_resume_state = self->state;
                 self->test_stall_axis = stalled;
+                self->stair_resume_elapsed_ms = in->now_ms - self->step_start_ms;
                 for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
                 {
                     int32_t pose = in->position_ecd[ch];
                     if (pose < in->limit_min_ecd[ch]) pose = in->limit_min_ecd[ch];
                     if (pose > in->limit_max_ecd[ch]) pose = in->limit_max_ecd[ch];
                     self->test_pause_ecd[ch] = pose;
+                    self->stair_resume_mm[ch] = self->axis_target_mm[ch];
                     self->axis_target_mm[ch] = in->position_mm[ch];
                 }
                 self->targets_valid = true;

@@ -60,5 +60,9 @@ void chassis_control_set_wheel_rpm(
     int16_t wheel3,
     int16_t wheel4);
 void chassis_control_set_velocity(float vx_mps, float vy_mps, float wz_radps);
+/* Stair owner has priority over remote commands. Refresh within 100 ms;
+ * an expired owner stops the chassis without restoring remote control. */
+void chassis_control_stair_velocity(float vx_mps);
+void chassis_control_stair_release(void);
 
 #endif

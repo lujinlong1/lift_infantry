@@ -173,6 +173,7 @@ typedef struct
     uint32_t retract_timeout_ms;
     uint32_t support_timeout_ms;
     bool lift_test_only; /* No chassis advance or waiting timeout. */
+    bool stair_debug_run; /* opt-in full-flow powered pause/stall hold */
 } lift_seq_config_t;
 
 typedef struct
@@ -289,6 +290,8 @@ typedef struct
     bool released;
 
     lift_seq_state_t test_resume_state;
+    int32_t stair_resume_mm[LIFT_CHANNEL_COUNT];
+    uint32_t stair_resume_elapsed_ms;
     int32_t test_pause_ecd[LIFT_CHANNEL_COUNT];
     int32_t test_stall_axis; /* -1 manual pause/no stalled axis */
 

@@ -29,6 +29,9 @@ chassis_control_status_t g_chassis_control_status;
 chassis_control_debug_t g_chassis_control_debug;
 
 static pid_controller_t wheel_speed_pid[4];
+static volatile bool stair_owned;
+static volatile float stair_vx;
+static volatile uint32_t stair_tick;
 static osThreadId_t chassis_control_task_handle;
 static StaticTask_t chassis_control_task_control;
 static StackType_t chassis_control_task_stack[
@@ -154,11 +157,11 @@ static void chassis_calculate_targets(int16_t target[4], float spin_wz_radps)
     float value;
     uint32_t index;
 
-    if (g_chassis_control_command.mode == CHASSIS_CONTROL_MODE_MECANUM)
+    if (stair_owned || g_chassis_control_command.mode == CHASSIS_CONTROL_MODE_MECANUM)
     {
-        const float vx = g_chassis_control_command.vx_mps;
-        const float vy = g_chassis_control_command.vy_mps;
-        const float commanded_wz = g_chassis_spin_command.enabled ?
+        const float vx = stair_owned ? stair_vx : g_chassis_control_command.vx_mps;
+        const float vy = stair_owned ? 0.0F : g_chassis_control_command.vy_mps;
+        const float commanded_wz = stair_owned ? 0.0F : g_chassis_spin_command.enabled ?
             spin_wz_radps : g_chassis_control_command.wz_radps;
         const float rotation = g_chassis_control_debug.rotation_radius_m *
                                commanded_wz;
@@ -311,7 +314,10 @@ static void chassis_control_task(void *argument)
             0.0F;
 
         /* 底盘使能和四轮在线缺一不可，任一异常都不允许部分车轮继续输出。 */
-        if (!g_chassis_control_command.enabled || !all_online)
+        if ((!stair_owned && !g_chassis_control_command.enabled) || !all_online ||
+            (stair_owned && stair_vx == 0.0F) ||
+            (stair_owned && (uint32_t)(current_tick - stair_tick) >
+             pdMS_TO_TICKS(CHASSIS_CONTROL_TIMEOUT_MS)))
         {
             chassis_stop_and_reset();
         }
@@ -361,6 +367,10 @@ void chassis_control_init(void)
         .output_limit = CHASSIS_PID_OUTPUT_LIMIT
     };
     uint32_t index;
+
+    stair_owned = false;
+    stair_vx = 0.0F;
+    stair_tick = 0U;
 
     (void)memset(&g_chassis_control_command, 0,
                  sizeof(g_chassis_control_command));
@@ -450,4 +460,24 @@ void chassis_control_set_velocity(float vx_mps, float vy_mps, float wz_radps)
     g_chassis_control_command.vy_mps = vy_mps;
     g_chassis_control_command.wz_radps = wz_radps;
     g_chassis_control_command.mode = CHASSIS_CONTROL_MODE_MECANUM;
+}
+
+void chassis_control_stair_velocity(float vx_mps)
+{
+    taskENTER_CRITICAL();
+    stair_vx = vx_mps;
+    stair_tick = osKernelGetTickCount();
+    stair_owned = true;
+    taskEXIT_CRITICAL();
+}
+
+void chassis_control_stair_release(void)
+{
+    taskENTER_CRITICAL();
+    g_chassis_control_command.enabled = false;
+    g_chassis_control_command.vx_mps = 0.0F;
+    g_chassis_control_command.vy_mps = 0.0F;
+    g_chassis_control_command.wz_radps = 0.0F;
+    stair_owned = false;
+    taskEXIT_CRITICAL();
 }

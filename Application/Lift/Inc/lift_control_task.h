@@ -196,7 +196,8 @@ typedef struct
      * confirmed front/rear layout, and clears stale advance requests.
      * Only the startup "already outside soft limits" fault is auto-reset.
      * Result: 0 idle, 1 accepted, 2 not homed, 3 busy, 4 fault,
-     * 5 bench owns motors, 6 invalid test height, 7 datum moving/offline.
+     * 5 bench owns motors, 6 invalid test height, 7 datum moving/offline,
+     * 8 invalid stair configuration, 9 chassis moving/offline.
      * Normal sequence prechecks and controller travel margins still apply.
      * Reaches TEST_HOLD (16), not chassis APPROACH_STEP. */
     volatile bool test_start;
@@ -207,6 +208,16 @@ typedef struct
     volatile bool test_lower;  /* pulse: descend; all axes near 2 mm -> latched zero current */
     volatile bool test_auto_zero; /* Default true: use stationary start pose if unhomed. */
     volatile bool test_extend_travel; /* provisional 200mm displacement compensation */
+    volatile bool stair_start; /* full stair flow; result uses test_start_result */
+    volatile int32_t stair_distance_mm[3]; /* default 0: must measure before starting */
+    volatile int32_t stair_speed_mm_s[3]; /* 10..200 mm/s */
+    volatile int32_t stair_contact_mm;
+    volatile int32_t stair_retracted_mm;
+    volatile bool stair_drive_release; /* only idle/complete; restore remote ownership */
+    volatile int32_t stair_drive_progress_mm;
+    volatile int8_t stair_drive_leg; /* -1 not advancing, 0..2 */
+    volatile uint8_t stair_drive_stop_reason; /* 0 normal, 1 offline, 2 no progress, 3 backwards */
+    volatile uint8_t stair_retracted_mask; /* latched zero-current axes during stair run */
 } lift_control_debug_t;
 
 /* 平铺的 volatile 状态，专供 Keil Watch 与调试记录使用。 */

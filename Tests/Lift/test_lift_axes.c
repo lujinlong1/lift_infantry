@@ -11,6 +11,10 @@ static unsigned cycles_left, writes, rear_nonzero_writes, front_retract_writes;
 static jmp_buf task_end;
 static robot_motor_state_t feedback;
 static int16_t sent[4];
+chassis_control_debug_t g_chassis_control_debug;
+static float stair_sent_vx;
+void chassis_control_stair_velocity(float vx) { stair_sent_vx = vx; }
+void chassis_control_stair_release(void) { stair_sent_vx = 0.0F; }
 dji_can_test_status_t g_dji_can_test_status;
 lift_jog_status_t g_lift_jog_status;
 uint32_t osKernelGetTickCount(void) { return fake_now; }
@@ -832,6 +836,110 @@ static void test_stall_holds_instead_of_cut(void)
     puts("provisional front/rear travel expansion and stalled-motion powered pause passed");
 }
 
+static void test_stair_debug(void)
+{
+    lift_seq_input_t in = {0};
+    lift_seq_status_t out;
+    unsigned ch;
+    setup();
+    g_chassis_control_debug.rpm_per_mps = 2404.946F;
+    for (ch=0; ch<4; ch++)
+    {
+        g_chassis_control_debug.motor_direction[ch] = ch==1 || ch==2 ? -1 : 1;
+        feedback.chassis.wheel[ch].initialized = true;
+    }
+    g_lift_control_debug.stair_start = true;
+    lift_handle_test_start(false);
+    assert(g_lift_control_debug.test_start_result==8 && !lift_stair_owned);
+    for (ch=0; ch<3; ch++) g_lift_control_debug.stair_distance_mm[ch]=100;
+    feedback.chassis.wheel[2].speed_rpm=3;
+    g_lift_control_debug.stair_start=true;
+    lift_handle_test_start(false);
+    assert(g_lift_control_debug.test_start_result==9 && !lift_stair_owned);
+    feedback.chassis.wheel[2].speed_rpm=0;
+    g_lift_control_debug.stair_start=true;
+    lift_handle_test_start(false);
+    assert(g_lift_control_debug.test_start_result==1 && lift_stair_owned);
+    assert(!g_lift_sequence.config.lift_test_only && g_lift_sequence.config.stair_debug_run);
+    assert(stair_sent_vx==0.0F);
+    g_lift_sequence.state=LIFT_SEQ_STATE_APPROACH_STEP;
+    assert(!lift_stair_drive(&feedback, fake_now));
+    assert(stair_sent_vx>0.0F);
+    for (ch=0; ch<4; ch++) feedback.chassis.wheel[ch].total_ecd =
+        stair_direction[ch]*(int32_t)(stair_counts_per_mm*40.0F);
+    fake_now+=100;
+    assert(!lift_stair_drive(&feedback,fake_now));
+    assert(g_lift_control_debug.stair_drive_progress_mm>=39);
+    g_lift_sequence.state=LIFT_SEQ_STATE_TEST_PAUSED;
+    fake_now+=10000;
+    assert(!lift_stair_drive(&feedback,fake_now) && stair_sent_vx==0.0F);
+    g_lift_sequence.state=LIFT_SEQ_STATE_APPROACH_STEP;
+    assert(!lift_stair_drive(&feedback,fake_now));
+    assert(g_lift_control_debug.stair_drive_progress_mm>=39);
+    for (ch=0; ch<4; ch++) feedback.chassis.wheel[ch].total_ecd =
+        stair_direction[ch]*(int32_t)(stair_counts_per_mm*101.0F);
+    assert(!lift_stair_drive(&feedback,fake_now));
+    assert(stair_sent_vx==0.0F);
+    fake_now+=100;
+    assert(lift_stair_drive(&feedback,fake_now));
+    g_lift_sequence.state=LIFT_SEQ_STATE_ADVANCE_MIDDLE;
+    assert(!lift_stair_drive(&feedback,fake_now));
+    assert(g_lift_control_debug.stair_drive_progress_mm==0);
+    fake_now+=2000;
+    assert(!lift_stair_drive(&feedback,fake_now));
+    assert(g_lift_control_debug.test_pause && g_lift_control_debug.stair_drive_stop_reason==2);
+    assert(stair_sent_vx==0.0F);
+
+    /* Unequal front/rear pose is intentional while retracting. Pause captures
+     * exact encoders; waiting does not consume stage timeout or confirmations. */
+    g_lift_sequence.state=LIFT_SEQ_STATE_RETRACT_FRONT;
+    g_lift_sequence.step_start_ms=1000;
+    g_lift_sequence.run_start_ms=1000;
+    g_lift_sequence.targets_valid=true;
+    for(ch=0;ch<4;ch++)
+    {
+        in.axis_online[ch]=true;
+        in.limit_max_ecd[ch]=150000;
+        in.position_ecd[ch]=ch<2 ? 15000 : 37500;
+        in.position_mm[ch]=ch<2 ? 20 : 50;
+        g_lift_sequence.axis_target_mm[ch]=ch<2 ? 2 : 50;
+    }
+    in.now_ms=1500;
+    in.sync_error_mm=30;
+    in.deviation_max_mm=30;
+    in.tracking_deviation_valid=true;
+    in.test_pause_request=true;
+    lift_seq_update(&g_lift_sequence,&in,&out);
+    assert(out.state==LIFT_SEQ_STATE_TEST_PAUSED && out.command_ecd_valid);
+    assert(out.axis_target_ecd[0]==15000 && out.axis_target_ecd[2]==37500);
+    in.test_pause_request=false;
+    in.now_ms=100000;
+    lift_seq_update(&g_lift_sequence,&in,&out);
+    assert(out.state==LIFT_SEQ_STATE_TEST_PAUSED && out.fault==LIFT_SAFETY_FAULT_NONE);
+    in.test_resume_request=true;
+    lift_seq_update(&g_lift_sequence,&in,&out);
+    assert(out.state==LIFT_SEQ_STATE_RETRACT_FRONT);
+    assert(out.axis_target_mm[0]==2 && out.axis_target_mm[2]==50);
+    assert(out.step_elapsed_ms==500);
+    /* Front axes near the retracted target are cut independently; rear
+     * support must still receive the controller's holding current. */
+    g_lift_sequence.state=LIFT_SEQ_STATE_RETRACT_FRONT;
+    g_lift_sequence.step_start_ms=fake_now;
+    g_lift_sequence.stall_active[0]=g_lift_sequence.stall_active[1]=false;
+    g_lift_control_debug.test_pause=false;
+    g_lift_control_debug.sequence_start=false;
+    g_lift_control_debug.stair_retracted_mask=0;
+    g_lift_control_debug.gravity_feedforward_current=1000.0F;
+    g_lift_control_debug.apply_gains=1;
+    for(ch=0;ch<4;ch++)
+        feedback.lift.motor[ch].total_ecd=lift_top.config.axis_direction[ch]*(ch<2 ? 1500 : 37500);
+    run_task(1);
+    assert(g_lift_control_debug.stair_retracted_mask==3);
+    assert(sent[0]==0 && sent[1]==0);
+    assert(sent[2]!=0 || sent[3]!=0);
+    puts("stair startup, per-leg odometry, stop/settle, stall and powered resume passed");
+}
+
 int main(void)
 {
     test_pid_antiwindup();
@@ -845,6 +953,7 @@ int main(void)
     test_manual_lift_controls();
     test_software_start_zero();
     test_stall_holds_instead_of_cut();
+    test_stair_debug();
     puts("all active axis-chain tests passed");
     return 0;
 }

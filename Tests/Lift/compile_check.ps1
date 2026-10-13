@@ -21,6 +21,7 @@ $liftInc = Join-Path $fwRoot 'Application\Lift\Inc'
 $liftSrc = Join-Path $fwRoot 'Application\Lift\Src'
 $jogInc  = Join-Path $fwRoot 'Diagnostics\MotorTest\Inc'
 $pidInc  = Join-Path $fwRoot 'Algorithms\Pid\Inc'
+$chassisInc = Join-Path $fwRoot 'Application\Chassis\Inc'
 $stubs   = Join-Path $dir 'fwstubs'
 
 # `lift_control_task.c` is the one that matters most: it is the integration
@@ -28,6 +29,7 @@ $stubs   = Join-Path $dir 'fwstubs'
 # without a full RTOS/HAL). Everything else is compiled by the unit suites
 # already, but compiling it here too keeps this check self-contained.
 $targets = @(
+    @{ name = 'chassis_control.c'; src = (Join-Path $fwRoot 'Application\Chassis\Src\chassis_control.c') },
     @{ name = 'lift_control_task.c'; src = (Join-Path $liftSrc 'lift_control_task.c') },
     @{ name = 'lift_top.c';          src = (Join-Path $liftSrc 'lift_top.c') },
     @{ name = 'lift_seq.c';          src = (Join-Path $liftSrc 'lift_seq.c') },
@@ -44,6 +46,7 @@ foreach ($t in $targets) {
     $args += ('-I' + $stubs)
     $args += ('-I' + $liftInc)
     $args += ('-I' + $pidInc)
+    $args += ('-I' + $chassisInc)
     $args += ('-I' + $jogInc)
     # The stub include dir must come FIRST so the fake HAL/RTOS headers win.
     $args += '-o'

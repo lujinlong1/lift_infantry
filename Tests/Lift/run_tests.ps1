@@ -22,6 +22,7 @@ $pidInc = Join-Path $fwRoot 'Algorithms\Pid\Inc'
 $pidSrc = Join-Path $fwRoot 'Algorithms\Pid\Src\pid.c'
 $liftInc = Join-Path $fwRoot 'Application\Lift\Inc'
 $liftSrc = Join-Path $fwRoot 'Application\Lift\Src'
+$chassisInc = Join-Path $fwRoot 'Application\Chassis\Inc'
 # Stub headers for the bench module's HAL/RTOS/motor dependencies.
 $jogStubs = Join-Path $dir 'jogstubs'
 $jogInc = Join-Path $fwRoot 'Diagnostics\MotorTest\Inc'
@@ -39,6 +40,7 @@ $fullSrc = @((LiftSrc 'lift_control.c'), (LiftSrc 'lift_sync.c'),
              $kinSrc, $safeSrc, $pidSrc)
 
 $suites = @(
+    @{ name = 'chassis_stair'; src = @($pidSrc); inc = @((Join-Path $dir 'fwstubs'), $chassisInc, $pidInc) },
     @{ name = 'lift_axes'; src = ($fullSrc + @((LiftSrc 'lift_top.c'), (LiftSrc 'lift_seq.c'))); inc = @((Join-Path $dir 'fwstubs'), $liftInc, $pidInc, $jogInc) },
     @{ name = 'lift_homing';  src = @((LiftSrc 'lift_homing.c'));  inc = @($liftInc) },
     @{ name = 'lift_guard';   src = @((LiftSrc 'lift_guard.c'));   inc = @($liftInc) },
@@ -69,6 +71,7 @@ try {
         $gccArgs += ('test_' + $s.name + '.c')
         $gccArgs += $s.src
         foreach ($i in $s.inc) { $gccArgs += ('-I' + $i) }
+        $gccArgs += ('-I' + $chassisInc)
         $gccArgs += '-o'
         $gccArgs += $exe
 

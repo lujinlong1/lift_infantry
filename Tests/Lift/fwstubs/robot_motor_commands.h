@@ -19,5 +19,6 @@ typedef struct
 extern dji_can_test_status_t g_dji_can_test_status;
 
 void robot_lift_set_currents(int16_t c0, int16_t c1, int16_t c2, int16_t c3);
+void robot_chassis_set_currents(int16_t c0, int16_t c1, int16_t c2, int16_t c3);
 
 #endif
