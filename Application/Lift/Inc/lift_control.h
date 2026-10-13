@@ -1,58 +1,17 @@
 #ifndef LIFT_CONTROL_H
 #define LIFT_CONTROL_H
 
-/*
- * 抬升模态控制器（对应议题 LIFT-008 的上半部分、LIFT-011 的时序基础）。
+/* M3508 + C620 rack-and-pinion lift control.
+ * Normal firmware: four axis targets -> coordinated reference planning ->
+ * per-axis position P -> speed PI + one load feedforward -> actuator-aware
+ * current/rate limits -> guard -> C620. Height/roll/pitch/warp are diagnostic
+ * transforms in this path; there is no extra modal current controller.
  *
- * 架构位置：
- *      lift_control（本模块：目标 -> 模态位置环 -> 模态速度环 -> 模态控制量）
- *            ↓  lift_sync_effort_t
- *      lift_sync（模态 -> 4 轴电流，翘曲恒 0）
- *            ↓  int32_t current[4]
- *      lift_guard（限位 / 缓降 / 门禁 / 离线）
- *            ↓
- *      robot_lift_set_currents()
- *
- * 本模块做四件事：
- *   1. 把 4 轴位置正变换成 4 个模态（复用 lift_sync_forward）
- *   2. 把 4 轴转速正变换成 4 个模态速度（复用 lift_sync_forward_speed）
- *   3. 对【高度 / 横滚 / 俯仰】各跑一条【串级】PID：
- *        位置环  目标位置 - 实际位置      -> 目标模态速度
- *        速度环  目标模态速度 - 实际速度  -> 模态控制量
- *   4. 对目标模态做斜坡限速，禁止目标突变
- *
- * ── 为什么是串级，而不是"位置环直接出电流" ───────────────────────────
- * 丝杆【不自锁】，而且负载是整车重力（ADR-006）。位置环单环在目标附近
- * 靠误差反向来刹车，落地时等效一根只有刚度、没有阻尼的弹簧：超调、
- * 来回抖，而抖动的代价是减速箱和 C620。
- * 速度环提供的正是那一点阻尼。参考实现（旧车 chassis_task.c 的 RisePosition）
- * 也是 位置 → 速度 → 电流 的三层结构，Yaw 轴同样是串级。
- *
- * ── 量纲（这里最容易搞错）───────────────────────────────────────────
- *   位置        ecd（编码器计数，单轴）
- *   模态位置    4 × ecd（转置伴随的约定，不除 4）
- *   速度        ecd/s（单轴），由 speed_rpm 换算
- *   模态速度    4 × ecd/s
- *   模态控制量  电流量纲；因为反变换不除 4，单模态指令下它就等于四轴各自的电流值
- *
- * 所以：
- *   - pid[POSITION].output_limit 必须填【最大模态速度】(ecd/s)
- *   - pid[SPEED].output_limit    必须填【最大轴电流】(C620 量纲)
- * 外环的输出是内环的目标，这两个上限量纲不同，串级最容易在这里出错。
- *
- * ── 转速语义开关 ────────────────────────────────────────────────────
- * C620 反馈的 speed_rpm 是【转子侧】还是【输出侧】，目前没有实机确认
- * （LIFT-007）。两种解释相差约 19 倍。与其在注释里写"待确认"，不如做成
- * 显式开关 speed_is_rotor：实机标定时翻一下就行，不用改公式。
- * 注意这个开关【不影响位置环】——位置的绝对量纲由零点与行程决定，
- * 只影响速度环的增益标定。
- *
- * 刻意不做的事：
- *   - 不碰翘曲模态。模态控制量里根本没有它的位置，见 lift_sync.h。
- *   - 不做电流限幅。那是 lift_guard 的职责，本模块输出的是未限幅的控制量。
- *   - 不判断"到位后停留多久"。本模块只给出瞬时到位标志，时间迟滞由上层时序负责。
- *
- * 设计约束：纯逻辑，无时间依赖（dt 与周期由配置给出），无 RTOS/HAL 依赖。
+ * The original modal API/fields remain for compatibility and regression.
+ * Their detailed comments below describe ONLY axis_control_enabled == false.
+ * The firmware task explicitly selects the axis path. All axis coordinates
+ * are logical (positive lift), rotor encoder counts and rotor ecd/s; current
+ * uses the C620 command units. No RTOS/HAL dependency.
  */
 
 #include "lift_sync.h"
@@ -230,6 +189,18 @@ typedef struct
      * <= 0 表示未知，此时【不做限幅预测】，只保留 guard 的逐轴兜底。
      */
     float actuator_gain_ecd_s_per_current;
+
+    /* Normal firmware uses independent axis P -> PI. Modal fields above are
+     * retained for compatibility; modal controllers do not run in this path. */
+    bool axis_control_enabled;
+    pid_config_t axis_pid[LIFT_CONTROL_LOOP_COUNT][LIFT_CHANNEL_COUNT];
+    float counts_per_mm[LIFT_CHANNEL_COUNT];
+    float axis_load_current[LIFT_CHANNEL_COUNT]; /* single gravity/hold FF */
+    float target_rate_mm_s;
+    float target_accel_mm_s2;
+    float sync_slow_mm;              /* tracking-error spread, not raw height */
+    float sync_stop_mm;
+    int32_t axis_current_limit;      /* includes the downstream guard ceiling */
 } lift_control_config_t;
 
 typedef struct
@@ -238,6 +209,8 @@ typedef struct
     int32_t target_height_ecd;
     int32_t target_roll_ecd;
     int32_t target_pitch_ecd;
+    bool axis_targets_valid;
+    int32_t axis_target_ecd[LIFT_CHANNEL_COUNT];
 } lift_control_command_t;
 
 typedef struct
@@ -265,6 +238,26 @@ typedef struct
     uint8_t hold_state[LIFT_CONTROL_MODE_COUNT];
     /* 本周期实际生效的逐级开放电流上限（模态量纲） */
     int32_t limit_open_current[LIFT_CONTROL_MODE_COUNT];
+    int32_t axis_target_ecd[LIFT_CHANNEL_COUNT]; /* bounded final target */
+    float axis_reference_ecd[LIFT_CHANNEL_COUNT];
+    float axis_position_error[LIFT_CHANNEL_COUNT];
+    float axis_target_speed_ecd_s[LIFT_CHANNEL_COUNT];
+    float axis_speed_ecd_s[LIFT_CHANNEL_COUNT];
+    float axis_filtered_speed_ecd_s[LIFT_CHANNEL_COUNT];
+    float axis_speed_error[LIFT_CHANNEL_COUNT];
+    float axis_position_output[LIFT_CHANNEL_COUNT];
+    float axis_speed_output[LIFT_CHANNEL_COUNT];
+    float axis_feedforward_current[LIFT_CHANNEL_COUNT];
+    float axis_final_current[LIFT_CHANNEL_COUNT];
+    float axis_sync_error_mm[LIFT_CHANNEL_COUNT];
+    float axis_speed_integral[LIFT_CHANNEL_COUNT];
+    float axis_limit_now[LIFT_CHANNEL_COUNT];
+    float axis_current_lower[LIFT_CHANNEL_COUNT];
+    float axis_current_upper[LIFT_CHANNEL_COUNT];
+    float axis_current_demand[LIFT_CHANNEL_COUNT];
+    uint8_t axis_hold_state[LIFT_CHANNEL_COUNT];
+    float sync_scale;
+    float sync_spread_mm;
 } lift_control_status_t;
 
 typedef struct
@@ -280,6 +273,16 @@ typedef struct
     float current_ramped[LIFT_CONTROL_MODE_COUNT];   /* 电流斜坡缓存 */
     int32_t limit_open[LIFT_CONTROL_MODE_COUNT];     /* 逐级开放已放到多少 */
     uint8_t hold_state[LIFT_CONTROL_MODE_COUNT];     /* 三态机 */
+    pid_controller_t axis_pid[LIFT_CONTROL_LOOP_COUNT][LIFT_CHANNEL_COUNT];
+    float axis_reference[LIFT_CHANNEL_COUNT];
+    float axis_reference_speed[LIFT_CHANNEL_COUNT];
+    float axis_filtered_speed[LIFT_CHANNEL_COUNT];
+    float axis_current[LIFT_CHANNEL_COUNT];
+    float axis_integral_before[LIFT_CHANNEL_COUNT];
+    float axis_open_limit[LIFT_CHANNEL_COUNT];
+    float planner_speed_mm_s;
+    bool axis_initialized;
+    bool axis_holding[LIFT_CHANNEL_COUNT];
 } lift_control_t;
 
 /* 初始化：填入默认 PID 参数与矩形布局，清空斜坡状态。config 为 NULL 时不修改。 */
@@ -319,5 +322,14 @@ void lift_control_update(
     const lift_control_command_t *command,
     lift_sync_effort_t *effort,
     lift_control_status_t *status);
+
+void lift_control_update_axes(lift_control_t *self,
+    const int32_t position[LIFT_CHANNEL_COUNT],
+    const int16_t speed_rpm[LIFT_CHANNEL_COUNT],
+    const lift_control_command_t *command, float dt_s,
+    int32_t current[LIFT_CHANNEL_COUNT], lift_control_status_t *status);
+/* Track the guard's actual logical output; blocked current must not wind up PI. */
+void lift_control_track_axes(lift_control_t *self,
+    const int16_t applied[LIFT_CHANNEL_COUNT], lift_control_status_t *status);
 
 #endif

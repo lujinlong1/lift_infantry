@@ -72,8 +72,8 @@ typedef struct
     volatile float kp;              /* 比例 */
     volatile float ki;              /* 积分 */
     volatile float kd;              /* 微分 */
-    volatile float integral_limit;  /* 积分限幅（<=0 表示不限） */
-    volatile float output_limit;    /* 输出限幅（电流量纲） */
+    volatile float integral_limit;  /* 原始误差积分限幅；0 会禁用积分，I项限幅=ki×该值 */
+    volatile float output_limit;    /* 位置环：速度 ecd/s；速度环：电流 */
 } lift_test_pid_t;
 
 /* ==================== 模式 1：每轴独立闭环 ==================== */
@@ -154,10 +154,10 @@ typedef struct
      * 这就是 yaw 的做法（`yaw_angle_pid.output_limit = max_speed_rpm`、
      * `yaw_speed_pid.output_limit = max_current`），照抄那个约定。
      *
-     * ── ★ 出厂增益全是 0（2026-10-09 用户要求"一个个调"）────────────
-     *   kp/ki/kd/integral_limit 都为 0，只有 output_limit 是有意义的数
-     *   （不然填上 kp 也会被 0 限幅卡死）。
-     *   ⚠️ 两条环的 kp **都非 0 才会动**。
+     * ── 出厂默认（以 lift_jog_task_create() 为准）─────────────────
+     *   位置 kp/ki/kd = 5/1/0；速度 kp/ki/kd = 2/0.5/0。
+     *   两环原始积分限幅均为 4000，速度环 I 项最多贡献 2000 电流。
+     *   即使 PID 增益清零，跟踪/保持前馈仍可能输出电流。
      *
      * ── ★ 改完立刻生效，不用重开 enabled ──────────────────────────
      *   增益**每周期映射**进 pid 控制器（只覆盖参数，保留积分/微分历史）；
@@ -193,7 +193,7 @@ typedef struct
      * 合并上来：两处语义完全相同（"目标最多走多快"），各存一份只会让人
      * 改错地方。现在只有这一个。
      *
-     * 默认 2000，照抄 pitch 的 `max_target_rate_deg_s`。**默认开着**：
+     * 默认 10000，照抄 pitch 的 `max_target_rate_deg_s`。**默认开着**：
      * 目标是阶跃时四层会同时饱和（位置环→速度环→电流→斜坡）→ 极限环。
      * 填 0 = 关掉斜坡（要纯阶跃响应调 PID 时才这么干）。
      */
@@ -250,8 +250,8 @@ typedef struct
      */
     volatile int32_t approach_min_speed_ecd_s;
 
-    /* 刹停死区（计数）：|误差| 小于它 → 先刹车、停住后转保持。
-     * 它同时就是"到位"的判据（取代原来固定的 200 容差）。 */
+    /* 刹停死区（计数）：最终目标已走完且误差进入死区后刹车/保持。
+     * 到位还要求进入 HOLD；跟上斜坡中间目标不算到达最终位置。 */
     volatile int32_t brake_deadband_ecd;
 
     /*
@@ -261,7 +261,7 @@ typedef struct
      * 按 current_limit_ramp_per_s 慢慢放开到 speed_pid.output_limit。
      * 每次 enabled 上升沿重新从 current_limit_start 开始。
      *
-     *   默认 2000 → 10000 电流/秒 → 2000 涨到 16000 约 1.4 s
+     *   默认 8000 → 20000 电流/秒 → 8000 涨到 16000 约 0.4 s
      * 空载大幅摆动就是"一上来就允许满电流"造成的。
      */
     volatile int32_t current_limit_start;
@@ -271,7 +271,7 @@ typedef struct
     volatile int32_t hold_speed_rpm;
 
     /*
-     * ★ 速度反馈一阶低通时间常数（ms）。**0 = 关闭（默认）**。
+     * ★ 速度反馈一阶低通时间常数（ms）。默认 20；0 = 关闭。
      *
      * 为什么需要它：C620 回的 speed_rpm 是**整数**，1 rpm = 8192/60 = 136.5 ecd/s。
      * 内环 kp = 120 时，**±1 rpm 的量化台阶就是 ±16380 电流 = 满量程**。
@@ -293,8 +293,12 @@ typedef struct
      * 方向：**正 = 伸出方向 = 把车顶起来**（托住车的那个方向）。
      *
      * 怎么测：用模式 3（FORCE 开环）慢慢加 hold_force_n，找到"刚好不下滑"的点，
-     * 换算成**每轴电流** = hold_force_n / 0.5705，填到四根上。
+     * 换算成**每轴电流** = hold_force_n / LIFT_TEST_FORCE_PER_CURRENT_N，
+     * 填到四根上（该常量 2026-10-11 实测重标为 0.8160，见 .c 里的推导）。
      * 0 = 不补偿（台架空载可以先填 0）。
+     *
+     * ⚠️ 更稳的做法是**按电流记录**：直接读 `applied_current` 找门槛，
+     *    标定完再回填系数。这样系数错了也不会把标定结果带偏。
      */
     volatile float   hold_feedforward_current[LIFT_CHANNEL_COUNT];
 
@@ -339,7 +343,7 @@ typedef struct
      *   - 四轴没全在线 → **拒绝启动**（enabled 置 1 也不动）
      *   - 运行中掉线   → **立刻零电流退出**
      *   - 两种情况都置 offline_abort = 1，并在 Watch 里看得见
-     *   - enabled 置回 0 才清除标记（下次使能重新判定）
+     *   - 自动清对应 enabled；offline_abort 保留到下次成功启动
      */
     volatile bool     offline_abort;      /* 1 = 因为某轴掉线被拒绝启动/中止 */
 
@@ -351,10 +355,10 @@ typedef struct
     volatile int16_t  axis_given_current[4];  /* 电调回显的电流：命令到了没有 */
     volatile int16_t  axis_output_current[4]; /* 我们下发的原始电流 */
     volatile uint8_t  axis_temperature[4];
-    volatile float    axis_position_pid_output[4]; /* ★位置环原始输出（限幅前，速度量纲 ecd/s） */
-    volatile float    axis_speed_pid_output[4];    /* ★速度环原始输出（限幅前，电流量纲） */
-    volatile int16_t  axis_ramped_current[4];      /* ★斜坡后的逻辑电流（加前馈、限幅前） */
-    volatile int16_t  axis_limit_now[4];           /* ★本周期实际生效的电流上限（逐级开放×减速收窄） */
+    volatile float    axis_position_pid_output[4]; /* ★位置 PID 限幅后的输出，速度 ecd/s */
+    volatile float    axis_speed_pid_output[4];    /* ★速度 PID 限幅后的输出，尚未加保持前馈 */
+    volatile int16_t  axis_ramped_current[4];      /* ★动态限流与斜坡后的逻辑电流 */
+    volatile int16_t  axis_limit_now[4];           /* ★本周期逐级开放的电流上限；接近减速只限速度 */
     volatile uint8_t  axis_hold_state[4];          /* ★0=APPROACH 1=BRAKE 2=HOLD，见 lift_test_hold_state_t */
     volatile bool     axis_online[4];
 
@@ -362,7 +366,7 @@ typedef struct
     volatile int32_t  axis_target_offset[4];  /* 逻辑目标偏移（已过目标斜坡） */
     volatile int32_t  axis_target_speed_ecd_s[4]; /* ★位置环给出的目标速度（速度环的给定） */
     volatile int32_t  axis_error[4];          /* 目标 − 实际（逻辑，位置） */
-    volatile bool     axis_at_target[4];      /* 该轴到位 */
+    volatile bool     axis_at_target[4];      /* 最终目标已收敛、位置进容差且进入 HOLD */
     volatile bool     at_target;              /* 四轴全部到位 */
     volatile bool     timed_out;              /* LENGTH：超时结束 */
 
@@ -380,9 +384,58 @@ typedef struct
     volatile uint32_t axis_gap_count[4];          /* 帧间隔 > 20ms 的次数（预警） */
     volatile uint32_t axis_gap_max_ms[4];         /* 最大帧间隔 */
     volatile uint32_t axis_feedback_count[4];     /* 收到反馈帧数：一直涨 = 通信正常 */
+
+    /*
+     * ---- 命令通道所有权诊断（2026-10-11 补）------------------------------
+     *
+     * 为什么要有这几个：台架"闭环在跑、目标也在、电流却是 0"这个现象，
+     * 根因可能是"抢不到 CAN 电流通道"，而这件事**原来在 Watch 里完全看不见** ——
+     * 只能靠猜是 PID 问题还是通道问题，白折腾。现在一眼就能分辨。
+     */
+    /* 本周期是否因为拿不到通道而没出力（1 = 没出力） */
+    volatile bool     own_lost;
+    /* 累计"没抢到通道"的次数。一直在涨 = 有人在持续占着通道 */
+    volatile uint32_t own_lost_count;
+    /* 累计"从主链手里接管通道"的次数。正常应该只涨几次（每次使能一两次） */
+    volatile uint32_t own_preempt_count;
+    /* 通道现在在谁手里（lift_owner_t：0=NONE 1=CONTROL 2=JOG 3=CAN_TEST） */
+    volatile uint8_t  own_holder;
 } lift_jog_status_t;
 
 extern lift_jog_status_t g_lift_jog_status;
+
+/* 结束原因；Watch 中 reason 的数值与此枚举一致。 */
+typedef enum
+{
+    LIFT_TEST_END_NONE = 0,
+    LIFT_TEST_END_COMPLETE = 1,
+    LIFT_TEST_END_TIMEOUT = 2,
+    LIFT_TEST_END_DISABLED = 3,
+    LIFT_TEST_END_ABORT = 4,
+    LIFT_TEST_END_OFFLINE = 5,
+    LIFT_TEST_END_MODE_CHANGED = 6,
+    LIFT_TEST_END_MODE_OFF = 7,
+    LIFT_TEST_END_STALL = 8
+} lift_test_end_reason_t;
+
+/*
+ * 最近一次结束/离线拒绝启动的 RAM 快照，清电流和 enabled 之前保存。
+ * valid 最后置 1；sequence 每次保存 +1。实时采样和下一次启动不覆盖它，
+ * 下一次结束覆盖；复位丢失。status.running 表示停止前状态，不是当前运行状态。
+ * 实际结束时自动清本模式 enabled；PER_AXIS 到位和 FORCE 非零保持不算结束。
+ */
+typedef struct
+{
+    volatile bool valid;
+    volatile uint32_t sequence;
+    volatile uint8_t reason;
+    volatile uint8_t mode;
+    volatile uint32_t end_tick;
+    lift_jog_status_t status;
+    lift_test_control_t parameters;
+} lift_test_snapshot_t;
+
+extern lift_test_snapshot_t g_lift_test_snapshot;
 
 /* 创建静态内存形式的台架测试任务。 */
 bool lift_jog_task_create(void);

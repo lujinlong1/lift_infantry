@@ -3,6 +3,7 @@
 #include "cmsis_os2.h"
 #include "dji_motor.h"
 #include "FreeRTOS.h"
+#include "lift_safety.h"
 #include "pid.h"
 #include "robot_motor_commands.h"
 #include "robot_motors.h"
@@ -44,10 +45,30 @@
 /*
  * 力 ↔ 电流 的换算系数（N 每 电流单位）。
  *   四轴合计 vs 一根轴相差 4 倍，所以分两个常量，从命名上杜绝混用。
- * 依据：M3508 原装减速箱 19.2:1 + 驱动齿轮分度圆 69 mm + 效率取 0.7。
- * ⚠️ 效率是估算，真实值有 ±30% 量级误差；用弹簧秤实测可反推校准。
+ *
+ * ★ 2026-10-11 实测重标：0.5705 → 0.8160。
+ *
+ * 推导（与机构扭矩链同构）：
+ *   力 ∝ 电流 · 减速比 · 齿轮半径 · 效率 · 2π
+ *   驱动齿轮分度圆是实测反推的（46.693 mm），与旧值同一个齿轮，
+ *   所以**只有减速比变了**：
+ *
+ *       0.5705 × (19.2 ÷ 13.43) = 0.8156 ≈ 0.8160
+ *
+ *   旧值 0.5705 建立在图纸的 19.2:1 上；实测减速比是 13.43（齿轮一圈
+ *   = 110000 计数），于是旧值**偏小约 43%** —— 用它标定会把"需要多少电流"
+ *   低估四成，抬不起来还以为是增益问题。
+ *
+ * ⚠️ 效率（旧推导取 0.7）仍是估算，所以这个新值也还是**估算**。
+ *    要变成实测值，用弹簧秤给恒定电流拉齿条、反推 N/电流 即可 ——
+ *    只改本常量，不动任何控制逻辑。
+ *
+ * ⚠️ 它对标定的直接影响：
+ *       hold_feedforward_current = hold_force_n ÷ 本常量
+ *    本常量错了，标出来的保持电流就错。G3 请**按电流记录**，
+ *    标定完再回填系数，不要反过来。
  */
-#define LIFT_TEST_FORCE_PER_CURRENT_N      0.5705F
+#define LIFT_TEST_FORCE_PER_CURRENT_N      0.8160F
 
 /*
  * 每轴力缩放的有效范围（LIFT_TEST_SCALE_MAX 是上限）。
@@ -60,6 +81,7 @@
 
 lift_test_control_t g_lift_test;
 lift_jog_status_t   g_lift_jog_status;
+lift_test_snapshot_t g_lift_test_snapshot;
 
 static osThreadId_t  lift_test_task_handle;
 static StaticTask_t  lift_test_task_control;
@@ -319,6 +341,49 @@ static void lift_test_zero_output(void)
 {
     uint32_t ch;
 
+    /*
+     * ★★ 2026-10-11 第二次修：判据从 "may_write" 改成 "自己是不是所有者"。
+     *
+     * 第一版（同一天早些时候）用的是 `lift_owner_may_write(JOG)`。那个判据
+     * 在【通道空闲】时也返回 true，于是出现这条时序：
+     *
+     *   T+0ms  主链：claim → 写电流 → release        （owner 立刻变回 NONE）
+     *   T+1ms  台架空闲（mode = 0）：zero_output()
+     *            → may_write(JOG) 看到 owner == NONE → true
+     *            → 写 0，把主链刚写的电流抹掉
+     *
+     * 结果：主链「能算出电流、也确实写了、然后每 5 ms 被抹一次」——
+     * 现象是"能抬升但抬不起来"。这是本项目第二次栽在同一个地方：
+     * 第一版是"台架空闲时无条件写 0"，第二版是"用错了判据，等于换个方式
+     * 无条件写 0"。两次的根因相同：**允许一个不拥有通道的模块去写它**。
+     *
+     * 正确规则：只有【自己当前是所有者】才写。
+     *   · 台架在跑（或刚跑完的最后那一拍）→ 它是所有者 → 写 0 是对的
+     *   · 台架空闲 → 它不是所有者 → **不碰通道**，主链独占
+     *
+     * 写 0 还有两个时刻需要，但那不是台架的活：
+     *   · 参数未生效 / 掉线 → 主链的门禁会主动写 0（那是保护动作）
+     */
+    if (lift_owner_current() != LIFT_OWNER_JOG)
+    {
+        /* 通道不是自己的：只把状态清干净，绝不碰 CAN 电流 */
+        g_lift_jog_status.running = false;
+        g_lift_jog_status.active = false;
+        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+        {
+            g_lift_jog_status.axis_output_current[ch] = 0;
+            g_lift_jog_status.axis_ramped_current[ch] = 0;
+            g_lift_jog_status.axis_target_offset[ch] = 0;
+            g_lift_jog_status.axis_target_speed_ecd_s[ch] = 0;
+            g_lift_jog_status.axis_position_pid_output[ch] = 0.0F;
+            g_lift_jog_status.axis_speed_pid_output[ch] = 0.0F;
+            g_lift_jog_status.axis_at_target[ch] = false;
+            test_current_ramp[ch] = 0.0F;
+        }
+        g_lift_jog_status.at_target = false;
+        return;
+    }
+
     robot_lift_set_currents(0, 0, 0, 0);
     g_lift_jog_status.running = false;
     g_lift_jog_status.active = false;
@@ -388,6 +453,7 @@ static void lift_test_begin(uint8_t mode, uint32_t now)
     g_lift_jog_status.remaining_ms = 0U;
     g_lift_jog_status.at_target = false;
     g_lift_jog_status.timed_out = false;
+    g_lift_jog_status.offline_abort = false;
     g_lift_jog_status.stall_latched = false;
     g_lift_jog_status.stall_timer_ms = 0U;
     g_lift_jog_status.applied_force_n = 0.0F;
@@ -417,12 +483,68 @@ static void lift_test_begin(uint8_t mode, uint32_t now)
     lift_test_capture_start();
 }
 
-static void lift_test_end(void)
+static bool lift_test_mode_enabled(uint8_t mode)
 {
+    switch (mode)
+    {
+    case LIFT_TEST_MODE_PER_AXIS: return g_lift_test.per_axis.enabled;
+    case LIFT_TEST_MODE_LENGTH: return g_lift_test.length.enabled;
+    case LIFT_TEST_MODE_FORCE: return g_lift_test.force.enabled;
+    default: return false;
+    }
+}
+
+static void lift_test_clear_enabled(uint8_t mode)
+{
+    switch (mode)
+    {
+    case LIFT_TEST_MODE_PER_AXIS: g_lift_test.per_axis.enabled = false; break;
+    case LIFT_TEST_MODE_LENGTH: g_lift_test.length.enabled = false; break;
+    case LIFT_TEST_MODE_FORCE: g_lift_test.force.enabled = false; break;
+    default: break;
+    }
+    if (test_seen_mode == mode)
+    {
+        test_enabled_last = false;
+    }
+}
+
+static void lift_test_save_snapshot(lift_test_end_reason_t reason, uint8_t mode)
+{
+    g_lift_test_snapshot.valid = false;
+    g_lift_test_snapshot.reason = (uint8_t)reason;
+    g_lift_test_snapshot.mode = mode;
+    g_lift_test_snapshot.end_tick = osKernelGetTickCount();
+    g_lift_test_snapshot.status = g_lift_jog_status;
+    g_lift_test_snapshot.parameters = g_lift_test;
+    if (test_running)
+    {
+        g_lift_test_snapshot.status.elapsed_ms =
+            (uint32_t)(g_lift_test_snapshot.end_tick - test_start_tick) *
+            (uint32_t)portTICK_PERIOD_MS;
+    }
+    g_lift_test_snapshot.sequence++;
+    g_lift_test_snapshot.valid = true;
+}
+
+static void lift_test_end(lift_test_end_reason_t reason)
+{
+    if (!test_running)
+    {
+        return; /* 空闲周期不能覆盖上次快照。 */
+    }
+    lift_test_save_snapshot(reason, test_active_mode);
+    lift_test_clear_enabled(test_active_mode);
     test_running = false;
     test_active_mode = (uint8_t)LIFT_TEST_MODE_OFF;
     g_lift_jog_status.active_mode = (uint8_t)LIFT_TEST_MODE_OFF;
+    /*
+     * 先写 0（此时自己还是所有者），再归还通道。
+     * 顺序不能反：归还之后 lift_test_zero_output() 就不会写 CAN 了
+     * （那不是自己的通道），最后那一下"收尾清零"就丢了。
+     */
     lift_test_zero_output();
+    lift_owner_release(LIFT_OWNER_JOG);
 }
 
 /*
@@ -433,7 +555,7 @@ static void lift_test_end(void)
  *   ② mode 变量本身变了（切模式）。
  * 结束时 end() 会把 test_running 清 0，但这里【不看】test_running ——
  * 否则下一拍就会自己重新启动（LENGTH 会一直重复爬升、距离累加）。
- * 想再跑一次：先把 enabled 清 0 再置 1，或者换一次模式。
+ * 结束自动清 enabled 和对应边沿记录，再跑一次只需重新置 1。
  */
 static bool lift_test_should_start(bool enabled, uint8_t mode)
 {
@@ -554,11 +676,11 @@ static int32_t lift_test_open_limit(uint32_t ch, int32_t full_limit)
  * 如果只给几十 ecd/s 的目标速度，会**卡在死区外面进不去**。
  * host 仿真实测过：收到 0 时停在误差 -1092 处、峰峰值 93 计数，就是进不了 ±1000。
  */
-static int32_t lift_test_approach_vmax(int32_t error, int32_t deadband)
+static int32_t lift_test_approach_vmax(uint32_t ch, int32_t error, int32_t deadband)
 {
     const int32_t zone = g_lift_test.approach_zone_ecd;
     const int32_t vmax = lift_test_round_i32(
-        g_lift_test.position_pid[0].output_limit);
+        g_lift_test.position_pid[ch].output_limit);
     const int32_t magnitude = lift_test_abs_i32(error);
     const int32_t vmin = (g_lift_test.approach_min_speed_ecd_s > 0)
         ? g_lift_test.approach_min_speed_ecd_s : 0;
@@ -646,7 +768,7 @@ static int16_t lift_test_cascade_axis(
      *      更推不动，卡在死区外进不去（实测停在误差 -1092，就是进不了 ±1000）。
      * 所以：收窄的是速度指令，而且**只收到 approach_min_speed_ecd_s**。
      */
-    approach_vmax = lift_test_approach_vmax(position_error, deadband);
+    approach_vmax = lift_test_approach_vmax(ch, position_error, deadband);
 
     /*
      * ---- ③ 三态：APPROACH / BRAKE / HOLD ----
@@ -785,8 +907,9 @@ static int16_t lift_test_cascade_axis(
 
     /* ---- ⑨ 硬限幅 + 方向折算 ---- */
     g_lift_jog_status.axis_error[ch] = position_error;
-    g_lift_jog_status.axis_at_target[ch] =
-        (lift_test_abs_i32(position_error) <= tolerance);
+    /* 跟上斜坡不是到达最终目标；BRAKE 期间也尚未停稳。只有 HOLD
+     * 分支可以报告到位，避免 LENGTH 在斜坡还没走完时结束并断力。 */
+    g_lift_jog_status.axis_at_target[ch] = false;
 
     return lift_test_logical_to_raw(ch, current);
 }
@@ -812,12 +935,24 @@ static bool lift_test_offline_guard(void)
         return true;
     }
 
+    g_lift_jog_status.offline_abort = true;
     if (test_running)
     {
-        lift_test_end();
+        lift_test_end(LIFT_TEST_END_OFFLINE);
     }
-    lift_test_zero_output();
-    g_lift_jog_status.offline_abort = true;
+    else
+    {
+        /*
+         * 没在跑（例如启动前就被挡住）：还没认领过通道，
+         * 这时只清状态，不碰 CAN —— 主链可能正在用。
+         */
+        lift_test_zero_output();
+        if (lift_test_mode_enabled(g_lift_test.mode))
+        {
+            lift_test_save_snapshot(LIFT_TEST_END_OFFLINE, g_lift_test.mode);
+        }
+    }
+    lift_test_clear_enabled(g_lift_test.mode);
     return false;
 }
 
@@ -837,6 +972,63 @@ static void lift_test_apply(const int16_t currents[LIFT_CHANNEL_COUNT])
     if (!lift_test_offline_guard())
     {
         return;   /* 守卫内部已经把 CAN 电流写成 0 了 */
+    }
+
+    /*
+     * ★★ 认领命令通道（2026-10-11）。
+     *
+     * 台架要出力，就必须先拿到这一组电流的所有权 —— 否则主链可能在同一
+     * 个 2 ms 发送窗口里也写一次，两边互相覆盖。
+     *
+     * ── 2026-10-11 第二次修：改成"可以抢占" ────────────────────────────
+     *
+     * 第一版是"抢不到就算了（静默 return）"。那是错的：主链每 5 ms 也会
+     * 认领同一个通道，两个任务同周期同优先级，于是台架会**频繁抢不到** ——
+     * 现象是"闭环在跑、目标也在、电流却是 0"，而且时好时坏（取决于调度顺序），
+     * 看起来像 PID 没调好，实际上是**命令通道被主链占着**。
+     *
+     * 现在：台架是**显式的人在调试**，优先级应该高于主链的自动输出。
+     * 所以先看通道在谁手里：
+     *   · 空着 / 是自己的        → 直接认领
+     *   · 主链占着              → **先让主链放手**（release），再认领
+     *   · CAN 测试占着          → 不抢（那是发送层整帧替换，抢了也没用），
+     *                             记一笔 own_lost_count，让操作手看得见
+     *
+     * ⚠️ 让主链放手是安全的：主链每周期都会重新判断"现在该不该我写"，
+     *    它下一拍自然会拿回去；而台架认领后一直持有到收尾
+     *    （见 lift_test_end），期间主链本来就不该写。
+     */
+    {
+        const lift_owner_t owner_now = lift_owner_current();
+
+        if ((owner_now != LIFT_OWNER_NONE) && (owner_now != LIFT_OWNER_JOG) &&
+            (owner_now != LIFT_OWNER_CONTROL))
+        {
+            /* CAN 测试占着：这是发送层的整帧替换，台架抢不到 */
+            g_lift_jog_status.own_lost = true;
+            g_lift_jog_status.own_lost_count++;
+            g_lift_jog_status.own_holder = (uint8_t)owner_now;
+            g_lift_jog_status.running = false;
+            return;
+        }
+
+        if (owner_now == LIFT_OWNER_CONTROL)
+        {
+            /* 主链占着：让位（它不是人，可以下一拍再拿回去） */
+            lift_owner_release(LIFT_OWNER_CONTROL);
+            g_lift_jog_status.own_preempt_count++;
+        }
+
+        if (!lift_owner_claim(LIFT_OWNER_JOG, osKernelGetTickCount()))
+        {
+            g_lift_jog_status.own_lost = true;
+            g_lift_jog_status.own_lost_count++;
+            g_lift_jog_status.own_holder = (uint8_t)lift_owner_current();
+            g_lift_jog_status.running = false;
+            return;
+        }
+        g_lift_jog_status.own_lost = false;
+        g_lift_jog_status.own_holder = (uint8_t)LIFT_OWNER_JOG;
     }
 
     robot_lift_set_currents(
@@ -874,6 +1066,10 @@ static void lift_test_run_per_axis(void)
     }
 
     lift_test_apply(currents);
+    if (!test_running)
+    {
+        return;
+    }
     g_lift_jog_status.at_target = all_at_target;
 }
 
@@ -912,6 +1108,10 @@ static void lift_test_run_length(uint32_t now)
     }
 
     lift_test_apply(currents);
+    if (!test_running)
+    {
+        return;
+    }
     g_lift_jog_status.at_target = all_at_target;
 
     /* 到位：全部进容差并稳定 settle_ms → 走完 */
@@ -924,7 +1124,8 @@ static void lift_test_run_length(uint32_t now)
         }
         else if ((uint32_t)(now - test_settle_tick) >= settle_ticks)
         {
-            lift_test_end();
+            g_lift_jog_status.remaining_ms = 0U;
+            lift_test_end(LIFT_TEST_END_COMPLETE);
             return;
         }
     }
@@ -937,7 +1138,8 @@ static void lift_test_run_length(uint32_t now)
     if (elapsed >= timeout_ticks)
     {
         g_lift_jog_status.timed_out = true;
-        lift_test_end();
+        g_lift_jog_status.remaining_ms = 0U;
+        lift_test_end(LIFT_TEST_END_TIMEOUT);
         return;
     }
 
@@ -960,13 +1162,16 @@ static void lift_test_run_length(uint32_t now)
  * 为什么以前会卡住：FORCE 只把 active 清 0，从不结束运行，于是
  * running 一直是 1，主抬升链被永久门禁，现象是"点动做完了、遥控/主链推不动"。
  */
-static void lift_test_force_finish(void)
+static void lift_test_force_finish(lift_test_end_reason_t reason)
 {
-    g_lift_jog_status.active = false;
-
+    g_lift_jog_status.remaining_ms = 0U;
     if (lift_test_force_to_current_total(g_lift_test.force.hold_force_n) == 0)
     {
-        lift_test_end();
+        lift_test_end(reason);
+    }
+    else
+    {
+        g_lift_jog_status.active = false;
     }
 }
 
@@ -1067,7 +1272,7 @@ static void lift_test_run_force(uint32_t now)
             if ((uint32_t)(now - test_force_stall_tick) >= stall_ticks)
             {
                 g_lift_jog_status.stall_latched = true;
-                lift_test_force_finish();
+                lift_test_force_finish(LIFT_TEST_END_STALL);
                 return;
             }
         }
@@ -1079,7 +1284,7 @@ static void lift_test_run_force(uint32_t now)
 
         if (elapsed >= test_duration_ticks)
         {
-            lift_test_force_finish();
+            lift_test_force_finish(LIFT_TEST_END_COMPLETE);
             return;
         }
 
@@ -1093,140 +1298,132 @@ static void lift_test_run_force(uint32_t now)
 /*  任务主体                                                             */
 /* ==================================================================== */
 
+/* 单周期服务函数：任务和主机回归测试执行同一条采样/门禁/输出路径。 */
+static void lift_test_update(uint32_t now)
+{
+    const uint8_t mode = g_lift_test.mode;
+    const bool enabled = lift_test_mode_enabled(mode);
+
+    /* ---- 先采样：与 enabled 无关 ---- */
+    lift_test_sample();
+
+    /*
+     * PID 的实时映射不在这里做，而在 lift_test_cascade_axis() 里 ——
+     * 那条路是闭环的必经之路，放那儿就不存在"忘了映射"的可能。
+     */
+
+    /* ---- 一键全停 / 关掉 / 换模式：立刻退出 ---- */
+    if (g_lift_test.abort || !enabled ||
+        (mode == (uint8_t)LIFT_TEST_MODE_OFF))
+    {
+        if (test_running)
+        {
+            const lift_test_end_reason_t reason = g_lift_test.abort
+                ? LIFT_TEST_END_ABORT
+                : ((mode == (uint8_t)LIFT_TEST_MODE_OFF)
+                    ? LIFT_TEST_END_MODE_OFF
+                    : ((mode != test_active_mode)
+                        ? LIFT_TEST_END_MODE_CHANGED : LIFT_TEST_END_DISABLED));
+            lift_test_end(reason);
+        }
+        /* abort 时也撤销尚未启动的当前请求，解除 abort 不会自行起动。 */
+        lift_test_clear_enabled(mode);
+        lift_test_zero_output();
+        (void)lift_test_should_start(false, mode);
+        return;
+    }
+
+    if (test_running && (mode != test_active_mode))
+    {
+        /* 保存被切走的模式，只清旧模式 enabled，随后按原有语义启动新模式。 */
+        lift_test_end(LIFT_TEST_END_MODE_CHANGED);
+    }
+
+    /*
+     * ---- ★★ 掉线保护（2026-10-10 质检补的安全缺口）----
+     *
+     * 放在 enabled 判断【之后】、装载/分派【之前】，所以它同时管两件事：
+     *   - 启动前：某轴不在线 → 直接拒绝启动（enabled 置 1 也不出力）
+     *   - 运行中：某轴掉线   → 立刻零电流退出
+     *
+     * 为什么必需：四根里掉一根，另外三根照样满电流推 → 车歪、机构被扭。
+     * 掉线判据用 dji_motor_feedback_is_online()（超时 LIFT_TEST_ONLINE_TIMEOUT_MS），
+     * 上电后 CAN 还没上来时也会被它挡住 —— 这是对的，宁可不动。
+     */
+    if (!lift_test_offline_guard())
+    {
+        return;
+    }
+
+    /*
+     * ---- 启动条件：本模式 enabled 的【上升沿】，或 mode 变量刚变过 ----
+     *
+     * ⚠️ 2026-10-11 修正：原判据是 `!test_running || 换了模式`，而 end()
+     *    会把 test_running 清 0 → 下一拍立刻又 begin()：LENGTH 一跑完就
+     *    自动重来、起点重记、距离一直接着累加；FORCE 同理会被反复重启。
+     *    而且"切到一个 enabled 已经是 1 的模式"会立刻启动，与注释写的
+     *    "enabled 上升沿"不符。
+     * 现在只认两件事：enabled 由 0 变 1，或者 mode 变量本身变了。
+     * 结束自动清 enabled，再跑一次只需置 1（或换一次模式）。
+     */
+    if (lift_test_should_start(enabled, mode))
+    {
+        /* 两个闭环模式共用同一套串级参数，所以判断合并成一条 */
+        if ((mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS) ||
+            (mode == (uint8_t)LIFT_TEST_MODE_LENGTH))
+        {
+            lift_test_pid_load(&g_lift_test);
+        }
+        lift_test_begin(mode, now);
+        g_lift_jog_status.active = true;   /* FORCE：进入抬升段 */
+    }
+
+    /* 完成/超时/掉线结束后，等待新的使能边沿；不再计算或写电流。 */
+    if (!test_running)
+    {
+        return;
+    }
+
+    if (mode != (uint8_t)LIFT_TEST_MODE_FORCE)
+    {
+        g_lift_jog_status.elapsed_ms =
+            (uint32_t)(now - test_start_tick) * (uint32_t)portTICK_PERIOD_MS;
+    }
+    else if (g_lift_jog_status.active)
+    {
+        g_lift_jog_status.elapsed_ms =
+            (uint32_t)(now - test_start_tick) * (uint32_t)portTICK_PERIOD_MS;
+    }
+    else
+    {
+        /* 保持段：计时不动 */
+    }
+
+    /* ---- 分派 ---- */
+    if (mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS)
+    {
+        lift_test_run_per_axis();
+    }
+    else if (mode == (uint8_t)LIFT_TEST_MODE_LENGTH)
+    {
+        lift_test_run_length(now);
+    }
+    else
+    {
+        lift_test_run_force(now);
+    }
+
+}
+
 static void lift_test_task(void *argument)
 {
     TickType_t last_wake_tick;
 
     (void)argument;
     last_wake_tick = xTaskGetTickCount();
-
     for (;;)
     {
-        const uint32_t now = osKernelGetTickCount();
-        const uint8_t mode = g_lift_test.mode;
-        bool enabled;
-
-        /* ---- 先采样：与 enabled 无关 ---- */
-        lift_test_sample();
-
-        /*
-         * PID 的实时映射不在这里做，而在 lift_test_cascade_axis() 里 ——
-         * 那条路是闭环的必经之路，放那儿就不存在"忘了映射"的可能。
-         */
-
-        if (mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS)
-        {
-            enabled = g_lift_test.per_axis.enabled;
-        }
-        else if (mode == (uint8_t)LIFT_TEST_MODE_LENGTH)
-        {
-            enabled = g_lift_test.length.enabled;
-        }
-        else if (mode == (uint8_t)LIFT_TEST_MODE_FORCE)
-        {
-            enabled = g_lift_test.force.enabled;
-        }
-        else
-        {
-            enabled = false;
-        }
-
-        /* ---- 一键全停 / 关掉 / 换模式：立刻退出 ---- */
-        if (g_lift_test.abort || !enabled ||
-            (mode == (uint8_t)LIFT_TEST_MODE_OFF))
-        {
-            if (test_running)
-            {
-                lift_test_end();
-            }
-            lift_test_zero_output();
-            /*
-             * 关掉了 → 清除掉线标记。
-             * 标记是"这一次使能尝试"的结论，要重新使能才会重新判定，
-             * 这样用户能在 Watch 里看到"上次为什么没动"。
-             */
-            g_lift_jog_status.offline_abort = false;
-            /*
-             * 边沿状态跟着实际值走：enabled 已经是 0 → 下次置 1 才算上升沿；
-             * abort 还是 1 而 enabled 仍为 1 → 不产生新的上升沿，避免
-             * "解除全停时悄悄自己又跑一次"。返回值在这里不用。
-             */
-            (void)lift_test_should_start(enabled, mode);
-            vTaskDelayUntil(
-                &last_wake_tick, pdMS_TO_TICKS(LIFT_TEST_PERIOD_MS));
-            continue;
-        }
-
-        /*
-         * ---- ★★ 掉线保护（2026-10-10 质检补的安全缺口）----
-         *
-         * 放在 enabled 判断【之后】、装载/分派【之前】，所以它同时管两件事：
-         *   - 启动前：某轴不在线 → 直接拒绝启动（enabled 置 1 也不出力）
-         *   - 运行中：某轴掉线   → 立刻零电流退出
-         *
-         * 为什么必需：四根里掉一根，另外三根照样满电流推 → 车歪、机构被扭。
-         * 掉线判据用 dji_motor_feedback_is_online()（超时 LIFT_TEST_ONLINE_TIMEOUT_MS），
-         * 上电后 CAN 还没上来时也会被它挡住 —— 这是对的，宁可不动。
-         */
-        if (!lift_test_offline_guard())
-        {
-            vTaskDelayUntil(
-                &last_wake_tick, pdMS_TO_TICKS(LIFT_TEST_PERIOD_MS));
-            continue;
-        }
-
-        /*
-         * ---- 启动条件：本模式 enabled 的【上升沿】，或 mode 变量刚变过 ----
-         *
-         * ⚠️ 2026-10-11 修正：原判据是 `!test_running || 换了模式`，而 end()
-         *    会把 test_running 清 0 → 下一拍立刻又 begin()：LENGTH 一跑完就
-         *    自动重来、起点重记、距离一直接着累加；FORCE 同理会被反复重启。
-         *    而且"切到一个 enabled 已经是 1 的模式"会立刻启动，与注释写的
-         *    "enabled 上升沿"不符。
-         * 现在只认两件事：enabled 由 0 变 1，或者 mode 变量本身变了。
-         * 想再跑一次：先把 enabled 清 0 再置 1（或换一次模式）。
-         */
-        if (lift_test_should_start(enabled, mode))
-        {
-            /* 两个闭环模式共用同一套串级参数，所以判断合并成一条 */
-            if ((mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS) ||
-                (mode == (uint8_t)LIFT_TEST_MODE_LENGTH))
-            {
-                lift_test_pid_load(&g_lift_test);
-            }
-            lift_test_begin(mode, now);
-            g_lift_jog_status.active = true;   /* FORCE：进入抬升段 */
-        }
-
-        if (mode != (uint8_t)LIFT_TEST_MODE_FORCE)
-        {
-            g_lift_jog_status.elapsed_ms =
-                (uint32_t)(now - test_start_tick) * (uint32_t)portTICK_PERIOD_MS;
-        }
-        else if (g_lift_jog_status.active)
-        {
-            g_lift_jog_status.elapsed_ms =
-                (uint32_t)(now - test_start_tick) * (uint32_t)portTICK_PERIOD_MS;
-        }
-        else
-        {
-            /* 保持段：计时不动 */
-        }
-
-        /* ---- 分派 ---- */
-        if (mode == (uint8_t)LIFT_TEST_MODE_PER_AXIS)
-        {
-            lift_test_run_per_axis();
-        }
-        else if (mode == (uint8_t)LIFT_TEST_MODE_LENGTH)
-        {
-            lift_test_run_length(now);
-        }
-        else
-        {
-            lift_test_run_force(now);
-        }
-
+        lift_test_update(osKernelGetTickCount());
         vTaskDelayUntil(
             &last_wake_tick, pdMS_TO_TICKS(LIFT_TEST_PERIOD_MS));
     }
@@ -1250,25 +1447,28 @@ bool lift_jog_task_create(void)
 
     (void)memset(&g_lift_test, 0, sizeof(g_lift_test));
     (void)memset(&g_lift_jog_status, 0, sizeof(g_lift_jog_status));
+    (void)memset(&g_lift_test_snapshot, 0, sizeof(g_lift_test_snapshot));
 
     g_lift_test.mode = (uint8_t)LIFT_TEST_MODE_OFF;
 
     /*
-     * ★★★ 减速 / 刹停 / 保持（2026-10-09 用户实测后的四条要求）
+     * ★★★ 减速 / 刹停 / 保持（2026-10-11 按实车重设，取代 10-09 的那一套）
      *
+     * 10-09 那套是按"占位行程 34 mm"和"没实测过 K"配的：
      *   ① ±5000 开始降电流    → approach_zone_ecd = 5000
      *   ② 启动电流要限制        → current_limit_start = 2000
      *   ③ 逐级开放电流限制      → current_limit_ramp_per_s = 10000
      *   ④ ±1000 就刹停 + 停后重力前馈 → brake_deadband_ecd = 1000
      *
-     * 为什么要这三层：用户实测 **1/2 两根轴在空载、限流 16000 时大幅摆动**。
-     * 一上来就允许满电流 + 贴着目标还满电流，是摆动的直接来源。
+     * 2026-10-11 实测踩到的坑：**current_limit_start = 2000 起步太慢**。
+     * 它要 1.4 秒才爬到 16000，而用户的起步门槛是 3000 —— 头一两秒
+     * 一直在门槛附近打转，看起来像"没使劲"。现在起点直接给 8000。
      */
-    g_lift_test.approach_zone_ecd = 5000;
-    g_lift_test.brake_deadband_ecd = 1000;
-    g_lift_test.current_limit_start = 2000;
-    g_lift_test.current_limit_ramp_per_s = 10000;
-    g_lift_test.approach_min_speed_ecd_s = 500;
+    g_lift_test.approach_zone_ecd = 10000;
+    g_lift_test.brake_deadband_ecd = 750;
+    g_lift_test.current_limit_start = 8000;
+    g_lift_test.current_limit_ramp_per_s = 20000;
+    g_lift_test.approach_min_speed_ecd_s = 750;
     g_lift_test.hold_speed_rpm = 20;
     /*
      * 速度反馈低通默认**开着 20 ms**（2026-10-09）：
@@ -1283,72 +1483,123 @@ bool lift_jog_task_create(void)
         test_start_raw[ch] = 0;
 
         /*
-         * ★★ 串级两条环的**出厂默认增益**（2026-10-09 按用户实测重设）。
+         * ★★ 串级两条环的**出厂默认增益** ★★
          *
-         * 用户实测把两环 P 填成 **60 / 320** 后出现大幅极限环：
-         *   GH = speed_kp × K × h = 320 × 0.5 × 0.005 = 0.80
-         *   而主抬升模块用的是 GH = 0.30（留 6 倍余量）。
-         * 所以出厂取保守值，用户再往上加：
-         *
-         *   position_pid.kp = 5     （外环；仿真扫描推荐 10，先给一半）
-         *   speed_pid.kp    = 60    （内环；GH = 0.15，推荐 120）
-         *
-         * ⚠️ 两条环的 kp **都非 0 才会动**：位置环出速度、速度环出电流。
-         *    只填一个 → 另一个输出 0 → 整条链还是 0。
+         * 历史：2026-10-09 曾按"用户把两环 P 填成 60 / 320 后大幅极限环"
+         * 定过一组保守值（60 / 5）。但那组建立在**两个没验证过的前提**上：
+         *   · K ≈ 0.5 (ecd/s) 每电流  —— 从没实测过
+         *   · 行程 34 mm             —— 占位值
+         * 2026-10-11 实测后两个前提都不成立（750 计数/mm、200 mm 行程），
+         * 所以重新扫参，见下。
          *
          * ── 量纲（填错就是飞车）──
          *   position_pid[ch].output_limit  = **速度 ecd/s**（"最高速度"）
-         *     4000 ecd/s ÷ 725 计数/mm ≈ 5.5 mm/s
          *   speed_pid[ch].output_limit     = **电流**（C620 量纲）
-         *     16000 是硬上限；**台架建议先填 5000**（用户实测 5000 就够，
-         *     空载轴在 16000 下容易摆）
+         * 两条环的 output_limit **量纲不同**，这是最容易填反的地方。
          *
-         * ── 调参顺序（照这个走）──
-         *   ① 先只加 speed_pid.kp：60 → 90 → 120 → …，加到刚要振退回一档
-         *   ② 内环定了再加 position_pid.kp：5 → 8 → 10 → …
-         *   ③ 全程盯 VOFA 通道 8~11（电流）：**只要还在跑满就说明在饱和区，别加**
+         * ── 扫参结果（_staging/tune_lift_jog.c，K = 0.5 / 2 / 9 三档）──
+         *
+         *   kp=0.5 ki=0.05 : 三档都**到不了 HOLD**（误差 -2237 就顶住不动）
+         *   kp=2   ki=0.5  : 三档都进 HOLD，超调 <=0.8%，误差 <=750  ★ 采用
+         *   kp=5   ki=1    : K=9 时进不了 HOLD
+         *   kp=10  ki=2    : K=9 时进不了 HOLD
+         *
+         *   规律：内环太软会在"重力+静摩擦"负载下**停在半路** —— 纯 P 的输出
+         *   恒定（误差被钉死），永远顶不过静摩擦。这正是用户实测"不动"的机理。
+         *   太硬则 K 小时振荡（GH = kp × K × h 太大）。
+         *   kp=2 / ki=0.5 是唯一在三档 K 下都收敛的。
+         *   K 未知（机械估算 2~9，旧模型假设 0.5），所以按最坏情况取。
          *
          * ── 实时生效 ──
          *   这两组增益**每周期映射**，Watch 里改完立刻生效，不用重开 enabled。
          *   （积分/微分历史只在 enabled 上升沿清一次，见 lift_test_pid_load()）
+         *
+         * ── 实车怎么复核 ──
+         *   跑起来后读 K = axis_speed_ecd_s ÷ axis_ramped_current。
+         *   K 若落在 2 附近说明内环正好；远大于 2 说明内环偏软，可把 kp 往上加。
          */
-        g_lift_test.speed_pid[ch].kp = 60.0F;
-        g_lift_test.speed_pid[ch].ki = 0.0F;
+        /*
+         * ★★★ 2026-10-11 按实测机械常数重标（用户要求"输出给满 16000"）★★★
+         *
+         * ── 为什么旧值（60 / 5）大错 ────────────────────────────────────
+         *
+         * 旧值是按"K ≈ 0.5 ecd/s 每电流"这个**没有实测过**的假设配的。
+         * 实测后重新算（依据见 lift_kinematics.h：750 计数/mm、13.43:1）：
+         *
+         *   速度环被控增益 K = 速度(ecd/s) ÷ 电流
+         *     M3508 每电流约 0.0015 N·m；经 13.43:1、齿轮 46.693 mm
+         *     → 位移速度 ≈ 9 ecd/s 每电流
+         *     最坏情况（效率差、电压低）取 K ≈ 2 ecd/s 每电流
+         *
+         *   内环开环增益 GH = kp × K × h（h = 5 ms）
+         *     旧值 kp = 60  →  GH = 60 × 2 × 0.005 = 0.6      ← 偏高，会振
+         *     新值 kp = 0.5 →  GH = 0.5 × 2 × 0.005 = 0.005   ← 很稳
+         *
+         *   外环（位置）kp：GH = kp × h = 5 × 0.005 = 0.025
+         *
+         * ⚠️ 这是**估算**，不是实测标定。K 必须靠实车反推（看
+         *    axis_speed_ecd_s ÷ axis_ramped_current）。所以下面的值是
+         *    "能安全动起来"的起点，不是最优值。
+         *
+         * ── 为什么速度环必须有 ki ───────────────────────────────────────
+         *
+         * 纯 P 速度环有个**数学上的死锁**（2026-10-11 实测踩到）：
+         *   电机需要 3000 电流才动 → 不动 → 速度恒为 0 → 误差恒为 5600
+         *   → 纯 P 输出 = 5600 × kp，**恒定不变**，永远到不了 3000 → 永远不动
+         * 加 ki 之后积分才会把电流顶上去。所以 ki **不能是 0**。
+         */
+        g_lift_test.speed_pid[ch].kp = 2.0F;
+        g_lift_test.speed_pid[ch].ki = 0.5F;
         g_lift_test.speed_pid[ch].kd = 0.0F;
         /*
          * ⚠️ integral_limit 的 0 = 【积分恒为 0】，不是"不限"！
          *    pid.c 的 pid_clamp() 是正负对称钳位，钳位到 0 就是把积分项清零。
          *    所以想用 ki 就必须先给 integral_limit 一个正数，否则怎么调 ki
          *    都毫无反应（2026-10-11 修：原来这里是 0，等于把 ki 焊死）。
-         *    单位是"误差×秒"：速度环误差是 ecd/s，20000 ≈ 满速误差 2 s 的量。
+         *    单位是"误差×秒"：速度环误差是 ecd/s，4000 ≈ 满速误差 0.25 s 的量。
          */
-        g_lift_test.speed_pid[ch].integral_limit = 20000.0F;
+        g_lift_test.speed_pid[ch].integral_limit = 4000.0F;
+        /* ★ 用户 2026-10-11 指定：输出给满量程，不再掐 */
         g_lift_test.speed_pid[ch].output_limit = 16000.0F;
 
         g_lift_test.position_pid[ch].kp = 5.0F;
-        g_lift_test.position_pid[ch].ki = 0.0F;
+        g_lift_test.position_pid[ch].ki = 1.0F;
         g_lift_test.position_pid[ch].kd = 0.0F;
-        /* 同理：0 会把位置环积分焊死。4000 = 位置环满输出速度 × 1 s。 */
+        /*
+         * 同理：0 会把位置环积分焊死。积分最多贡献 4000 ecd/s
+         * （= 输出上限 16000 的 25%），够消稳态误差，不抢戏。
+         */
         g_lift_test.position_pid[ch].integral_limit = 4000.0F;
-        /* ★ 速度量纲：最高 4000 ecd/s ≈ 5.5 mm/s。它不是电流！ */
-        g_lift_test.position_pid[ch].output_limit = 4000.0F;
+        /*
+         * ★ 速度量纲：最高 16000 ecd/s ≈ 21.3 mm/s（750 计数/mm）。
+         *
+         * 2026-10-11 由 4000 提到 16000：4000 ecd/s 只有 5.3 mm/s，
+         * 走 100000 计数（133 mm）要 25 秒，太慢。
+         * 注意它**不是电流**，填错量纲就是飞车。
+         */
+        g_lift_test.position_pid[ch].output_limit = 16000.0F;
 
         /*
-         * ★ 电流斜坡：60000 电流/秒 → 5 ms 每周期走 300 → 0→16000 约 0.27 s。
+         * ★ 电流斜坡：40000 电流/秒 → 5 ms 每周期走 200 → 0→16000 约 0.4 s。
          *
          * 它一头防"PID 一瞬间到 16000"（用户实测的冲击），
          * 另一头还**参与稳定**：斜坡太慢（20000）时电流跟不上、
          * 刹不住车，过冲反而从 1.9% 涨到 19%。这两个方向都别调过头。
          */
-        g_lift_test.current_ramp_per_s[ch] = 60000;
+        g_lift_test.current_ramp_per_s[ch] = 40000;
 
-        /* 摩擦力前馈：先给 0（关闭），调参时按注释里的建议打开 */
         /*
-         * 刹停后的重力前馈。**必须实测**，先给 0（台架空载可以先 0）。
-         * 测法：模式 3 慢慢加 hold_force_n 到"刚好不下滑"，
-         *       每轴电流 = hold_force_n ÷ 0.5705，四根都填这个数。
+         * 刹停后的重力前馈。**必须实测**（它取决于整车重量，代码里推不出来）。
+         *
+         * 2026-10-11 实测：**3000 电流/轴是"车开始动"的门槛**（用户手测）。
+         * 所以先给 4000（留 33% 余量）作为可用的起点：
+         *   · 停住后缓慢下沉 → 往上加（4000 → 5000 → 6000）
+         *   · 停住后往上顶   → 往下减
+         *
+         * ⚠️ 它**任何状态都加**（不只 HOLD），所以它同时承担"起步助力"和
+         *    "停住托住"两件事。方向：**正 = 伸出 = 把车顶起来**。
          */
-        g_lift_test.hold_feedforward_current[ch] = 0.0F;
+        g_lift_test.hold_feedforward_current[ch] = 4000.0F;
 
         /* 模式 1：每轴独立闭环 —— 各轴目标先给 0（不动） */
         g_lift_test.per_axis.target_ecd[ch] = 0;
@@ -1360,12 +1611,21 @@ bool lift_jog_task_create(void)
     /*
      * 目标斜坡默认**开着**（照抄 pitch 的 max_target_rate_deg_s）：
      * 顶层定义处有完整理由 —— 阶跃目标会让四层同时饱和 → 极限环。
-     * 想让目标也慢慢走，就填一个速度（ecd/s）；要纯阶跃就填 0。
+     *
+     * 2026-10-11：2000 → 10000 ecd/s（= 13.3 mm/s，750 计数/mm）。
+     *   2000 太慢：走 100000 计数（133 mm）要 50 秒。
+     *   10000 走完约 10 秒，同时仍然比"阶跃"柔和得多。
      */
-    g_lift_test.target_rate_ecd_s = LIFT_TEST_DEFAULT_TARGET_RATE_ECD_S;
-    g_lift_test.length.length_ecd = 0;
+    g_lift_test.target_rate_ecd_s = 10000;
+    /*
+     * 默认就给一次"能直接跑"的行程：100000 计数 = 133.3 mm。
+     * 用户 2026-10-11 指定。**使能仍然是关的**（length.enabled = 0），
+     * 所以上电不会自己动 —— 要跑必须显式把 enabled 置 1。
+     */
+    g_lift_test.length.length_ecd = 100000;
     g_lift_test.length.settle_ms = LIFT_TEST_DEFAULT_SETTLE_MS;
-    g_lift_test.length.timeout_ms = LIFT_TEST_DEFAULT_TIMEOUT_MS;
+    /* 13.3 mm/s 走 133 mm 约 10 s；给 60 s 余量（含起步/收尾） */
+    g_lift_test.length.timeout_ms = 60000U;
 
     g_lift_test.force.force_n = 0.0F;
     g_lift_test.force.duration_ms = LIFT_TEST_DEFAULT_LIFT_MS;

@@ -1,6 +1,7 @@
 #include "lift_control.h"
 
 #include <stddef.h>
+#include <math.h>
 #ifdef LIFT_LIMIT_TRACE
 #include <stdio.h>
 #endif
@@ -12,6 +13,235 @@
 #define MODE_HEIGHT LIFT_CONTROL_MODE_HEIGHT
 #define MODE_ROLL   LIFT_CONTROL_MODE_ROLL
 #define MODE_PITCH  LIFT_CONTROL_MODE_PITCH
+
+static float axis_clamp(float value, float lo, float hi)
+{
+    return value < lo ? lo : (value > hi ? hi : value);
+}
+
+/* The modal inverse is used only to accept the existing manual command API.
+ * Sequence targets remain four independent logical encoder positions. */
+void lift_control_update_axes(lift_control_t *self,
+    const int32_t position[LIFT_CHANNEL_COUNT],
+    const int16_t speed_rpm[LIFT_CHANNEL_COUNT],
+    const lift_control_command_t *command, float dt_s,
+    int32_t current[LIFT_CHANNEL_COUNT], lift_control_status_t *status)
+{
+    float delta[LIFT_CHANNEL_COUNT], error_mm[LIFT_CHANNEL_COUNT];
+    float max_distance = 0.0F, min_error = 0.0F, max_error = 0.0F;
+    float max_speed, mean_error = 0.0F, counts_sum = 0.0F;
+    int32_t ref32[LIFT_CHANNEL_COUNT], speed32[LIFT_CHANNEL_COUNT];
+    lift_sync_modes_t modes;
+    uint32_t ch;
+    const lift_control_config_t *cfg;
+    if (!self || !position || !speed_rpm || !command || !current || !status)
+        return;
+    cfg = &self->config;
+    *status = (lift_control_status_t){0};
+    status->limit_scale = 1.0F;
+    status->sync_scale = 1.0F;
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++) current[ch] = 0;
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+        counts_sum += cfg->counts_per_mm[ch];
+    if (counts_sum <= 0.0F) { lift_control_reset(self); return; }
+    if (dt_s <= 0.0F) dt_s = cfg->period_s;
+    /* Long task pauses must not cause an unbounded reference/current jump. */
+    dt_s = axis_clamp(dt_s, 0.001F, 0.020F);
+    lift_sync_forward(&cfg->sync, position, &status->actual);
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        float target, cpm = cfg->counts_per_mm[ch];
+        float lo = (float)cfg->limit_height_min_ecd[ch];
+        float hi = (float)cfg->limit_height_max_ecd[ch] - cfg->limit_margin_ecd;
+        float speed = lift_control_speed_to_ecd_s(cfg, speed_rpm[ch]);
+        if (cpm <= 0.0F || hi < lo) { lift_control_reset(self); return; }
+        if (command->axis_targets_valid)
+            target = (float)command->axis_target_ecd[ch];
+        else
+            target = (cfg->sync.w_height[ch] * (float)command->target_height_ecd +
+                      cfg->sync.w_roll[ch] * (float)command->target_roll_ecd +
+                      cfg->sync.w_pitch[ch] * (float)command->target_pitch_ecd) *
+                cpm / counts_sum;
+        status->axis_target_ecd[ch] = (int32_t)axis_clamp(target, lo, hi);
+        if ((float)status->axis_target_ecd[ch] != target) status->limit_active = true;
+        status->axis_position_error[ch] =
+            (float)status->axis_target_ecd[ch] - (float)position[ch];
+        status->axis_speed_ecd_s[ch] = speed;
+        speed32[ch] = (int32_t)speed;
+        current[ch] = 0;
+        if (!self->axis_initialized)
+        {
+            self->axis_reference[ch] = (float)position[ch];
+            self->axis_reference_speed[ch] = 0.0F;
+            self->axis_filtered_speed[ch] = speed;
+            self->axis_current[ch] = 0.0F;
+            self->axis_holding[ch] = false;
+            self->axis_open_limit[ch] = cfg->current_limit_start > 0 &&
+                cfg->current_limit_ramp_per_s > 0 ?
+                (float)cfg->current_limit_start : (float)cfg->axis_current_limit;
+        }
+        delta[ch] = ((float)status->axis_target_ecd[ch] - self->axis_reference[ch]) / cpm;
+        if (fabsf(delta[ch]) > max_distance) max_distance = fabsf(delta[ch]);
+        error_mm[ch] = (self->axis_reference[ch] - (float)position[ch]) / cpm;
+        mean_error += error_mm[ch] * 0.25F;
+        if (ch == 0U || error_mm[ch] < min_error) min_error = error_mm[ch];
+        if (ch == 0U || error_mm[ch] > max_error) max_error = error_mm[ch];
+    }
+    lift_sync_forward(&cfg->sync, speed32, &status->actual_speed);
+    if (!command->enabled)
+    {
+        lift_control_reset(self);
+        return;
+    }
+    self->axis_initialized = true;
+    /* Supervise mismatch relative to the moving references. A commanded
+     * front/rear height difference is not a synchronization error. */
+    status->sync_spread_mm = max_error - min_error;
+    if (cfg->sync_stop_mm > cfg->sync_slow_mm &&
+        status->sync_spread_mm > cfg->sync_slow_mm)
+        status->sync_scale = axis_clamp((cfg->sync_stop_mm - status->sync_spread_mm) /
+            (cfg->sync_stop_mm - cfg->sync_slow_mm), 0.0F, 1.0F);
+    max_speed = fminf(cfg->target_rate_mm_s,
+        sqrtf(2.0F * cfg->target_accel_mm_s2 * max_distance));
+    self->planner_speed_mm_s += axis_clamp(max_speed - self->planner_speed_mm_s,
+        -cfg->target_accel_mm_s2 * dt_s, cfg->target_accel_mm_s2 * dt_s);
+    status->at_target = true;
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        float cpm = cfg->counts_per_mm[ch];
+        float fraction = max_distance > 0.0F ? fminf(1.0F,
+            self->planner_speed_mm_s * status->sync_scale * dt_s / max_distance) : 0.0F;
+        float step = delta[ch] * fraction * cpm;
+        float ref_speed = step / dt_s;
+        float final_error = status->axis_position_error[ch];
+        float tolerance = (float)cfg->settle_tolerance_ecd;
+        float velocity_limit = cfg->axis_pid[LIFT_CONTROL_LOOP_POSITION][ch].output_limit;
+        float ff, lower, upper, limit, output, pos_output, desired_speed;
+        float alpha = cfg->speed_filter_tau_ms > 0 ?
+            dt_s / (dt_s + (float)cfg->speed_filter_tau_ms * 0.001F) : 1.0F;
+        pid_controller_t *speed_pid = &self->axis_pid[LIFT_CONTROL_LOOP_SPEED][ch];
+        /* Preserve acceleration limits across target changes/reversals too.
+         * Synchronization STOP overrides the trajectory immediately. */
+        if (status->sync_scale <= 0.0F)
+            ref_speed = 0.0F;
+        else
+            ref_speed = self->axis_reference_speed[ch] + axis_clamp(
+                ref_speed - self->axis_reference_speed[ch],
+                -cfg->target_accel_mm_s2 * cpm * dt_s,
+                cfg->target_accel_mm_s2 * cpm * dt_s);
+        step = ref_speed * dt_s;
+        if (step * delta[ch] >= 0.0F && fabsf(step) > fabsf(delta[ch] * cpm))
+            step = delta[ch] * cpm;
+        {
+            float bounded = axis_clamp(self->axis_reference[ch] + step,
+                (float)cfg->limit_height_min_ecd[ch],
+                (float)cfg->limit_height_max_ecd[ch] - cfg->limit_margin_ecd);
+            step = bounded - self->axis_reference[ch];
+        }
+        ref_speed = step / dt_s;
+        self->axis_reference_speed[ch] = ref_speed;
+        self->axis_reference[ch] += step;
+        self->axis_filtered_speed[ch] += alpha *
+            (status->axis_speed_ecd_s[ch] - self->axis_filtered_speed[ch]);
+        /* Position P only: no gravity integral in the outer loop. */
+        pos_output = cfg->axis_pid[LIFT_CONTROL_LOOP_POSITION][ch].kp *
+            (self->axis_reference[ch] - (float)position[ch]);
+        pos_output = axis_clamp(pos_output, -velocity_limit, velocity_limit);
+        desired_speed = pos_output + ref_speed;
+        /* Apply the speed ceiling AFTER adding reference velocity. */
+        desired_speed = axis_clamp(desired_speed, -velocity_limit, velocity_limit);
+        /* Braking distance caps the final approach in either direction. */
+        {
+            float brake_limit = sqrtf(2.0F * cfg->target_accel_mm_s2 *
+                fabsf(final_error) / cpm) * cpm;
+            desired_speed = axis_clamp(desired_speed, -brake_limit, brake_limit);
+        }
+        if (fabsf(final_error) > tolerance * 2.0F || fabsf(delta[ch] * cpm) > tolerance * 2.0F)
+            self->axis_holding[ch] = false;
+        if (fabsf(final_error) <= tolerance && fabsf(delta[ch] * cpm) <= tolerance)
+            self->axis_holding[ch] = true;
+        if (self->axis_holding[ch])
+        {
+            desired_speed = 0.0F;
+            status->axis_hold_state[ch] = fabsf(status->axis_speed_ecd_s[ch]) <=
+                cfg->hold_speed_ecd_s ? LIFT_CONTROL_HOLD_HOLD : LIFT_CONTROL_HOLD_BRAKE;
+        }
+        if (fabsf(final_error) > tolerance ||
+            fabsf(status->axis_speed_ecd_s[ch]) > cfg->hold_speed_ecd_s ||
+            fabsf(delta[ch] * cpm) > tolerance)
+            status->at_target = false;
+        /* HOLD continues PI: retain learned supporting current, avoid the
+         * old HOLD->zero PI->fall->APPROACH switching cycle. */
+        ff = cfg->axis_load_current[ch];
+        if (cfg->feedforward_min_position_ecd > 0 &&
+            position[ch] <= cfg->feedforward_min_position_ecd) ff = 0.0F;
+        self->axis_open_limit[ch] = fminf((float)cfg->axis_current_limit,
+            self->axis_open_limit[ch] + cfg->current_limit_ramp_per_s * dt_s);
+        limit = fminf(self->axis_open_limit[ch], speed_pid->config.output_limit);
+        lower = -limit;
+        upper = limit;
+        if (cfg->current_ramp_per_s > 0)
+        {
+            lower = fmaxf(lower, self->axis_current[ch] - cfg->current_ramp_per_s * dt_s);
+            upper = fminf(upper, self->axis_current[ch] + cfg->current_ramp_per_s * dt_s);
+        }
+        /* Hard travel protection takes priority over current slew. */
+        if (position[ch] >= cfg->limit_height_max_ecd[ch]) upper = fminf(upper, 0.0F);
+        if (position[ch] <= cfg->limit_height_min_ecd[ch]) lower = fmaxf(lower, 0.0F);
+        if (lower > upper) lower = upper = 0.0F;
+        self->axis_integral_before[ch] = speed_pid->integral;
+        output = pid_calculate_limited(speed_pid, desired_speed,
+            self->axis_filtered_speed[ch], dt_s, lower - ff, upper - ff);
+        self->axis_current[ch] = axis_clamp(output + ff, lower, upper);
+        current[ch] = (int32_t)self->axis_current[ch];
+        status->axis_reference_ecd[ch] = self->axis_reference[ch];
+        status->axis_target_speed_ecd_s[ch] = desired_speed;
+        status->axis_speed_error[ch] = speed_pid->error;
+        status->axis_filtered_speed_ecd_s[ch] = self->axis_filtered_speed[ch];
+        status->axis_position_output[ch] = pos_output;
+        status->axis_speed_output[ch] = output;
+        status->axis_feedforward_current[ch] = ff;
+        status->axis_final_current[ch] = (float)current[ch];
+        status->axis_speed_integral[ch] = speed_pid->integral;
+        status->axis_limit_now[ch] = limit;
+        status->axis_current_lower[ch] = lower;
+        status->axis_current_upper[ch] = upper;
+        status->axis_current_demand[ch] = speed_pid->p_output + speed_pid->i_output +
+            speed_pid->d_output + ff;
+        status->axis_sync_error_mm[ch] = error_mm[ch] - mean_error;
+        ref32[ch] = (int32_t)self->axis_reference[ch];
+        speed32[ch] = (int32_t)desired_speed;
+    }
+    lift_sync_forward(&cfg->sync, ref32, &modes);
+    status->ramped_height_ecd = modes.height;
+    status->ramped_roll_ecd = modes.roll;
+    status->ramped_pitch_ecd = modes.pitch;
+    lift_sync_forward(&cfg->sync, speed32, &modes);
+    status->target_speed_height = modes.height;
+    status->target_speed_roll = modes.roll;
+    status->target_speed_pitch = modes.pitch;
+    status->error_height_ecd = command->target_height_ecd - status->actual.height;
+    status->limit_active = status->limit_active || status->sync_scale < 1.0F;
+}
+
+void lift_control_track_axes(lift_control_t *self,
+    const int16_t applied[LIFT_CHANNEL_COUNT], lift_control_status_t *status)
+{
+    uint32_t ch;
+    if (!self || !applied || !status) return;
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        pid_controller_t *pid = &self->axis_pid[LIFT_CONTROL_LOOP_SPEED][ch];
+        if (pid->error * (status->axis_final_current[ch] - (float)applied[ch]) > 0.0F)
+        {
+            pid->integral = self->axis_integral_before[ch];
+            pid->i_output = pid->config.ki * pid->integral;
+        }
+        self->axis_current[ch] = (float)applied[ch];
+        status->axis_final_current[ch] = (float)applied[ch];
+        status->axis_speed_integral[ch] = pid->integral;
+    }
+}
 
 /** 取 32 位绝对值。 */
 static int32_t control_abs_i32(int32_t value)
@@ -451,6 +681,14 @@ void lift_control_reset(lift_control_t *self)
      * 而不是从 0 或旧目标跳过去。
      */
     self->ramp_initialized = false;
+    self->axis_initialized = false;
+    self->planner_speed_mm_s = 0.0F;
+    {
+        uint32_t loop, ch;
+        for (loop = 0U; loop < LIFT_CONTROL_LOOP_COUNT; loop++)
+            for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+                pid_reset(&self->axis_pid[loop][ch]);
+    }
 }
 
 void lift_control_init(lift_control_t *self, const lift_control_config_t *config)
@@ -570,6 +808,8 @@ void lift_control_init(lift_control_t *self, const lift_control_config_t *config
         {
             pid_init(&self->pid[loop][mode], &self->config.pid[loop]);
         }
+        for (mode = 0U; mode < LIFT_CHANNEL_COUNT; mode++)
+            pid_init(&self->axis_pid[loop][mode], &self->config.axis_pid[loop][mode]);
     }
 
     self->ramp_initialized = false;

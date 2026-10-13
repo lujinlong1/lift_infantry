@@ -1367,6 +1367,26 @@
               <FileType>5</FileType>
               <FilePath>..\Application\Lift\Inc\lift_control_task.h</FilePath>
             </File>
+            <File>
+              <FileName>lift_kinematics.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_kinematics.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_kinematics.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_kinematics.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_safety.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_safety.c</FilePath>
+            </File>
+            <File>
+              <FileName>lift_safety.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\Application\Lift\Inc\lift_safety.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

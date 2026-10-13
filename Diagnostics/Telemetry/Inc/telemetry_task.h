@@ -11,7 +11,8 @@
 typedef enum
 {
     TELEMETRY_SOURCE_PITCH = 0,   /* 8 通道：Pitch 遥控/控制量（原行为） */
-    TELEMETRY_SOURCE_LIFT  = 1    /* 28 通道：抬升四轴串级调试（每轴一块） */
+    TELEMETRY_SOURCE_LIFT  = 1,   /* 28 通道：旧台架控制器 */
+    TELEMETRY_SOURCE_LIFT_CONTROL = 2 /* 28 通道：实际四轴抬升主控制器 */
 } telemetry_source_t;
 
 /*
@@ -27,7 +28,7 @@ typedef enum
  *      +5 本周期电流上限 axis_limit_now  （逐级开放后的实时限幅）
  *      +6 电调回显电流 axis_given_current（C620 报回来的，确认命令到了）
  *
- *   于是 y1~y4 = 第 0 根的全部量、y5~y8 = 第 1 根……看一根就框一块。
+ *   因此通道 0~6 是 ch0，7~13 是 ch1，14~20 是 ch2，21~27 是 ch3。
  *   （以前是按"量"分组，四根交织，看一根要在四个地方找。）
  *
  * ★ 怎么用这 7 条曲线：
@@ -41,6 +42,12 @@ typedef enum
  *       [+6] ≈ 0 而 [+2] 满 → **命令没送到电调**，查 CAN 线/电调，跟 PID 无关。
  *       （2026-10-09 出现过"电流满 16000、轴却以 384535 ecd/s 跑飞"，
  *         必须先排除"电流其实没送到"这一种可能。）
+ *
+ * source=2 uses the same channel blocks for the main lift controller:
+ * +0 homed position, +1 final target, +2 logical applied current,
+ * +3 actual speed, +4 target speed, +5 current limit, +6 logical feedback
+ * current. Positions are encoder counts from the confirmed physical datum;
+ * positive current and speed mean extension on every axis.
  */
 #define TELEMETRY_LIFT_CHANNELS   28U
 /* 每根轴占几个通道（改通道内容时这个数要跟着改，打包函数按它算块起点）。 */

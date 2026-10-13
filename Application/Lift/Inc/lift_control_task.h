@@ -1,6 +1,7 @@
 #ifndef LIFT_CONTROL_TASK_H
 #define LIFT_CONTROL_TASK_H
 
+#include "lift_seq.h"
 #include "lift_top.h"
 
 #include <stdbool.h>
@@ -11,18 +12,23 @@
  *
  * 分层（见 讨论池/抬升模块架构.md）：
  *
- *   遥控（remote_lift） / 将来 lift_seq
- *        │  写 g_lift_task_command
+ *   遥控（remote_lift） ┐
+ *                       ├─ 写 g_lift_task_command
+ *   lift_seq（上台阶）  ┘
+ *        │
  *        ▼
  *   本任务（5 ms）
  *        │  快照反馈 → lift_top_update() → robot_lift_set_currents()
  *        ▼
- *   lift_top ─► lift_control ─► lift_sync ─► lift_guard ─► CAN1 0x200
+ *   lift_top ─► 四轴 lift_control ─► lift_guard ─► CAN1 0x200
+ *        └─► lift_kinematics（毫米 ↔ 每轴计数，每轴独立零点与系数）
  *
- * 对外只暴露三样东西：
+ * 对外只暴露这几样东西：
  *   1. g_lift_task_command：命令面（其它任务/调试器写，本任务读）
  *   2. g_lift_control_debug：标定参数（改完置 apply=1 才生效）
  *   3. g_lift_control_status：只读状态，给 Keil Watch 与遥测用
+ *   4. g_lift_sequence / g_lift_seq_status：上台阶流程的状态与人工接口
+ *   5. g_remote_lift_debug（在 remote_lift.h）：上台阶流程的启动/中止/确认
  */
 
 /*
@@ -44,6 +50,12 @@ typedef struct
     volatile bool reset_request;
     /* 每次命令 API 调用都会刷新；用于受控超时缓降判定。 */
     volatile uint32_t command_update_tick;
+    /* ch2/ch3 已在机械最低点。先置 1，再发 homing_request；
+     * 随找零请求一起消费清零，仅确认后轴，不影响前轴运动找零。 */
+    volatile bool rear_at_minimum_confirmed;
+    /* 前轴实际接触承重点后写 bit0=ch0、bit1=ch1（两根都接触写 3）。
+     * 单周期请求，消费后清零。不得仅因停转而确认接触。 */
+    volatile uint8_t front_contact_confirmed_mask;
 } lift_task_command_t;
 
 /*
@@ -70,14 +82,27 @@ typedef struct
     volatile uint8_t set_zero_now;
     /*
      * 手动增益开关：
-     *   0 = 增益由机械常数自动派生（推荐，防"两套增益"混乱）
+     *   0 = 使用明确的初始 P/PI 参数（需实机验证，不由静态 K 推导）
      *   1 = 用手填的 position_kp/ki/kd 与 speed_kp/ki/kd（调试用）
-     * 置 1 后 lift_derive_gains() 不再覆盖这些字段。
+     * 置 1 后 lift_select_pid_preset() 不再覆盖这些字段。
      */
     volatile bool pid_manual_override;
+    /* Shared PID preset unless manually overridden. Per-axis override allows
+     * front/rear load tuning; outer loop supports P only. */
+    volatile bool axis_pid_override;
+    volatile pid_config_t axis_position_pid[4];
+    volatile pid_config_t axis_speed_pid[4];
+    volatile float axis_counts_per_mm[4];
+    volatile bool axis_feedforward_override;
+    volatile float axis_load_current[4];
+    volatile float target_rate_mm_s;
+    volatile float target_accel_mm_s2;
+    volatile float sync_slow_mm;
+    volatile float sync_stop_mm;
     volatile int8_t axis_direction[4];
 
     volatile int16_t homing_seek_current;
+    volatile int16_t homing_contact_current; /* 前轴接触找零：正=伸出 */
     volatile int16_t homing_backoff_current;
     volatile int16_t homing_preposition_current;
     volatile int16_t homing_current_limit;
@@ -119,7 +144,7 @@ typedef struct
     volatile int32_t limit_margin_ecd;
     /*
      * 重力/保持前馈（单轴电流量纲，填正数 = 抬升方向）。
-     * 只在四轴最低的那根高过 feedforward_min_position_ecd 时施加。
+     * 逐轴高过 feedforward_min_position_ecd 时施加；axis_feedforward_override=1 用四轴独立值。
      */
     volatile float gravity_feedforward_current;
     volatile int32_t feedforward_min_position_ecd;
@@ -127,16 +152,61 @@ typedef struct
 
     /*
      * ---- 平滑链（2026-10-11 从台架模块移植，量纲都是【模态量】）--------
-     * 模态量 = 四轴之和 = 单轴 × 4；默认值在 lift_control_task.c 的 1c 节
-     * 按 mm/s 换算出来，要改"抬升多快"只动 LIFT_TARGET_RATE_MM_S 一个数。
+     * max_target_step / approach_* 为旧模态兼容字段，主链不使用。
+     * 新主链速度/加速度用 target_rate_mm_s / target_accel_mm_s2。
      */
     volatile int32_t approach_zone_ecd;         /* 减速区起点（模态计数） */
     volatile int32_t approach_min_speed_ecd_s;  /* 减速区最低速度（模态 ecd/s） */
-    volatile int32_t hold_speed_ecd_s;          /* 判"停住"（模态 ecd/s） */
-    volatile int32_t current_ramp_per_s;        /* 电流 di/dt（模态电流/秒） */
+    volatile int32_t hold_speed_ecd_s;          /* 判"停住"（新链为单轴 ecd/s） */
+    volatile int32_t current_ramp_per_s;        /* 电流 di/dt（新链逐轴电流/秒） */
     volatile int32_t current_limit_start;       /* 逐级开放起点（电流） */
     volatile int32_t current_limit_ramp_per_s;  /* 逐级开放速度（电流/秒） */
     volatile int32_t speed_filter_tau_ms;       /* 速度反馈低通（ms，0 = 关） */
+
+    /* ---- 分阶段上台阶流程（见 lift_seq.h）------------------------------
+     *
+     * 全部在这里，是因为流程的人机接口只有"几个开关 + 一句提示"：
+     * 放进 Watch 就能操作与判读，不需要另开一套协议。
+     */
+    /*
+     * ⚠️ **前后轮组布局确认**。默认 false。
+     *
+     * 2026-10-13 用户确认：ch0/ch1 为前辅助轮，ch2/ch3 为后麦轮。
+     * 更换接线或机械布局后仍需重新核对；本开关保留为流程门禁。
+     * 收错一组 = 把还在承担重量的支撑收掉 = 翻车。
+     * 所以流程在 PRECHECK 会因为这个开关是 false 而**拒绝启动**。
+     *
+     * 确认方法（2 分钟，架空或垫住车做）：单轴给一点抬升力，
+     * 看是车头还是车尾在动。确认后把它置 1。
+     */
+    volatile bool sequence_layout_confirmed;
+    /* 底盘/操作手声明"这一段前进已经到位"。 */
+    volatile bool sequence_drive_done;
+    /* 接触开关输入（现在没有传感器，恒 false；接线后直接接上）。 */
+    volatile bool sequence_contact_front;
+    volatile bool sequence_contact_rear;
+    /* 单周期请求脉冲（本任务消费后清零）。 */
+    volatile bool sequence_start;
+    volatile bool sequence_abort;
+    volatile bool sequence_confirm;
+    volatile bool sequence_release;   /* 人力解除：已确认机械支撑 */
+    volatile bool sequence_reset;
+    /* One-shot lift-only test. Default height is 50 mm;
+     * test_height_mm is adjustable in Watch (9..200 mm). Sets height/8/2 mm,
+     * confirmed front/rear layout, and clears stale advance requests.
+     * Only the startup "already outside soft limits" fault is auto-reset.
+     * Result: 0 idle, 1 accepted, 2 not homed, 3 busy, 4 fault,
+     * 5 bench owns motors, 6 invalid test height, 7 datum moving/offline.
+     * Normal sequence prechecks and controller travel margins still apply.
+     * Reaches TEST_HOLD (16), not chassis APPROACH_STEP. */
+    volatile bool test_start;
+    volatile uint8_t test_start_result;
+    volatile int32_t test_height_mm;
+    volatile bool test_pause;  /* pulse: freeze measured pose, keep powered */
+    volatile bool test_resume; /* pulse: resume lift or descent */
+    volatile bool test_lower;  /* pulse: descend; all axes near 2 mm -> latched zero current */
+    volatile bool test_auto_zero; /* Default true: use stationary start pose if unhomed. */
+    volatile bool test_extend_travel; /* provisional 200mm displacement compensation */
 } lift_control_debug_t;
 
 /* 平铺的 volatile 状态，专供 Keil Watch 与调试记录使用。 */
@@ -181,6 +251,37 @@ typedef struct
     volatile bool command_fresh;
     volatile bool configuration_rejected;
     volatile bool limit_blocked[4];
+    /*
+     * 故障停机动作的真实状态（见 lift_safety.h）：
+     *   stop_action   0 = HOLD / 1 = LOWER / 2 = CUT
+     *   stop_active   动作还没做完
+     *   stop_capable  **保持电流已标定**，HOLD/LOWER 不会退化成断电
+     *
+     * ⚠️ stop_capable == 0 意味着：现在任何故障都会导致四轴断电。
+     *    本机构不自锁，那就是掉车。**这是能力缺口，不是可以忽略的提示。**
+     */
+    volatile uint8_t stop_action;
+    volatile bool stop_active;
+    volatile bool stop_capable;
+    /*
+     * 运动学标定是否完整（系数 + 每轴行程）。见 lift_kinematics.h。
+     * false 时"毫米"这个单位在固件里没有意义，绝对值动作应当被拒绝。
+     */
+    volatile bool kinematics_ready;
+    volatile int32_t counts_per_mm_x1000[4];   /* 每轴系数 × 1000 */
+    volatile int32_t travel_max_mm[4];         /* 每轴有效行程（mm） */
+    /*
+     * 四轴一致性判据（**毫米**，由 lift_kinematics 每轴独立换算后算出）。
+     *   sync_error_mm    四轴高度极差（最高那根减最低那根）
+     *   deviation_max_mm 单轴相对"其余轴参考高度"的最大偏差
+     *
+     * ⚠️ 这两个量在【上台阶过程中本来就会很大】：前组收到 40 mm、
+     *    后组还撑在 200 mm，极差 160 mm 是设计状态。
+     *    所以它们只能用来判"收敛后的姿态"，不能拿来判过程中的动作 ——
+     *    lift_seq 里就是按这个原则分的（见 lift_seq.c 的 seq_tilt_unrecovered）。
+     */
+    volatile int32_t sync_error_mm;
+    volatile int32_t deviation_max_mm;
     volatile int32_t raw_position_ecd[4];
     volatile int32_t zero_ecd[4];
     volatile int32_t homed_position_ecd[4];
@@ -220,10 +321,10 @@ typedef struct
     volatile int32_t limit_height_max_ecd[4];
     volatile int32_t command_height_min_ecd;
     volatile int32_t command_height_max_ecd;
-    /* 模态限幅比例 0..1：<1 表示有轴接近行程界、出力被统一压制。 */
+    /* 旧模态兼容读数；新链看 axis_sync_scale / axis_* 数组。 */
     volatile float limit_scale;
     volatile bool limit_active;
-    /* 控制链内部量（模态量纲），排障用：斜坡后目标 / 位置环输出 / 限幅前控制量 */
+    /* 变换后的参考/速度仅供诊断；control_effort_height 在轴链为 0。 */
     volatile int32_t ramped_height_ecd;
     volatile int32_t target_speed_height_ecd_s;
     volatile int32_t control_effort_height;
@@ -240,20 +341,101 @@ typedef struct
     volatile uint32_t update_count;
     volatile uint32_t parameter_apply_count;
     volatile uint32_t safety_refresh_count;   /* 目标被强制压回的周期数 */
-    /*
-     * 由机械常数派生出来的增益。**它们不是手填的**，改 K 或周期就会整体变。
-     * 上板第一件事就是看这三项：speed_loop_kp 若已经贴到 speed_loop_kp_max，
-     * 说明 K 太大或周期太长，必须先解决，否则"一通电就冲、然后在目标两侧撞限幅"。
-     * 用 float 存是为了在 Watch 里直接看到数值。
-     */
+    /* Shared effective preset/manual gains. speed_loop_kp_max is deprecated
+     * and zero: the static actuator K is not a physical stability bound.
+     * Per-axis override gains are read from lift_top.config.control.axis_pid. */
     volatile float speed_loop_kp;
     volatile float speed_loop_kp_max;
     volatile float position_loop_kp;
+    volatile bool axis_control_active;
+    volatile float cycle_dt_s;
+    volatile int32_t axis_target_ecd[4];
+    volatile float axis_reference_ecd[4];
+    volatile float axis_position_error[4];
+    volatile float axis_target_speed_ecd_s[4];
+    volatile float axis_speed_ecd_s[4];
+    volatile float axis_filtered_speed_ecd_s[4];
+    volatile float axis_speed_error[4];
+    volatile float axis_position_pid_output[4];
+    volatile float axis_speed_pid_output[4];
+    volatile float axis_feedforward_current[4];
+    volatile float axis_final_current[4]; /* logical applied, not requested */
+    volatile int16_t axis_feedback_current[4]; /* logical C620 measured */
+    volatile float axis_speed_integral[4];
+    volatile float axis_limit_now[4];
+    volatile float axis_current_lower[4];
+    volatile float axis_current_upper[4];
+    volatile float axis_current_demand[4];
+    volatile float axis_sync_error_mm[4];
+    volatile uint8_t axis_hold_state[4];
+    volatile float axis_sync_scale;
+    volatile float axis_sync_spread_mm;
 } lift_task_status_t;
+
+/*
+ * 分阶段上台阶流程的状态（见 lift_seq.h）。挑出操作手与调试最需要的几项
+ * 平铺发布，方便 Keil Watch 直接看，不用展开嵌套结构。
+ */
+typedef struct
+{
+    volatile uint8_t seq_state;          /* lift_seq_state_t */
+    volatile uint8_t seq_fault;          /* lift_safety_fault_t */
+    volatile uint8_t seq_stop_action;    /* lift_stop_action_t */
+    volatile uint8_t seq_support;        /* lift_support_t */
+    volatile bool    seq_active;         /* 流程正在控制抬升 */
+    volatile bool    seq_waiting_confirm;
+    volatile bool    seq_drive_request;  /* 该往前开了（人/底盘执行） */
+    volatile bool    seq_released;       /* 已人工解除（确认有机械支撑） */
+    volatile uint32_t seq_confirm_count;
+    volatile uint32_t seq_elapsed_ms;
+    volatile int32_t  seq_axis_target_mm[4];
+    volatile int32_t  seq_hold_mm;
+    /*
+     * 需要人做什么 / 故障明细。**静态字符串**（编译期常量），
+     * 不做动态分配、也不指向栈上变量。
+     */
+    volatile const char *seq_operator_action;
+    volatile const char *seq_fault_detail;
+    volatile int32_t     seq_fault_axis;   /* -1 = 与单轴无关 */
+    volatile int32_t test_stall_axis; /* stalled test motion -> powered pause */
+} lift_seq_pub_t;
+
+/* Latest sequence fault, captured before stop handling changes the outputs.
+ * Survives sequence/top resets; overwritten only by a new fault or task init.
+ * valid is published last. Currents/target_ecd are the preceding control cycle;
+ * position, raw feedback current and speed come from this fault cycle. */
+typedef struct
+{
+    volatile bool valid;
+    volatile uint32_t count;
+    volatile uint32_t tick_ms;
+    volatile uint32_t stage_elapsed_ms;
+    volatile uint8_t stage;
+    volatile const char *stage_name;
+    volatile uint8_t fault;
+    volatile const char *detail;
+    volatile int32_t fault_axis;
+    volatile uint8_t guard_state;
+    volatile uint8_t guard_fault;
+    volatile uint8_t top_fault;
+    volatile bool command_fresh;
+    volatile int32_t sync_error_mm;
+    volatile int32_t deviation_max_mm;
+    volatile int32_t position_ecd[4];
+    volatile int32_t target_ecd[4];
+    volatile int32_t target_mm[4];
+    volatile float applied_current[4]; /* logical direction */
+    volatile int16_t feedback_current[4]; /* logical direction */
+    volatile int16_t speed_rpm[4]; /* raw motor direction */
+    volatile bool online[4];
+} lift_fault_snapshot_t;
 
 extern lift_task_command_t g_lift_task_command;
 extern lift_control_debug_t g_lift_control_debug;
 extern lift_task_status_t g_lift_control_status;
+extern lift_seq_t g_lift_sequence;
+extern lift_seq_pub_t g_lift_seq_status;
+extern lift_fault_snapshot_t g_lift_fault_snapshot;
 
 /* 初始化命令面与标定参数的默认值（不产生任何电流）。 */
 void lift_control_task_init(void);

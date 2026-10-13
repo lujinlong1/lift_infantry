@@ -33,4 +33,12 @@ float pid_calculate(
     float measurement,
     float dt_seconds);
 
+/* Actuator-aware conditional integration. Limits apply to the PID correction
+ * (subtract feedforward from the final current/rate window before calling).
+ * This explicit window replaces config.output_limit; the caller includes that
+ * ceiling in the FINAL actuator window, before subtracting feedforward.
+ * Existing pid_calculate callers retain their original behavior. */
+float pid_calculate_limited(pid_controller_t *pid, float target,
+    float measurement, float dt_seconds, float lower, float upper);
+
 #endif

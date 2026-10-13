@@ -3,6 +3,7 @@
 #include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "lift_jog_task.h"
+#include "lift_control_task.h"
 #include "pitch_control.h"
 #include "remote_control_task.h"
 #include "task.h"
@@ -13,9 +14,10 @@
 /*
  * 无线串口波形（VOFA+ JustFloat）。
  *
- * ── 两种波形源，用 g_telemetry_status.source 切 ────────────────────
+ * ── 波形源，用 g_telemetry_status.source 切 ────────────────────
  *   0 = PITCH（8 通道，原来的行为）
  *   1 = LIFT （28 通道 = 每根抬升一块 7 条，见 telemetry_task.h）
+ *   2 = LIFT_CONTROL (28 channels from the active main controller)
  *
  * 为什么不做成"两帧交替发"：USART1 是 115200，抬升帧 116 字节 ≈ 10.1 ms，
  * 20 ms 周期只用掉一半带宽，还够用。交替发只会让两边都变慢、还难对齐时间轴；
@@ -97,6 +99,30 @@ static uint32_t telemetry_build_lift_frame(void)
     return sizeof(values);
 }
 
+/* Main controller, with the same seven-channel block per axis. Position is
+ * relative to the physical homing datum; all currents use logical lift signs. */
+static uint32_t telemetry_build_lift_control_frame(void)
+{
+    float values[TELEMETRY_LIFT_CHANNELS];
+    uint32_t ch;
+
+    taskENTER_CRITICAL();
+    for (ch = 0U; ch < 4U; ch++)
+    {
+        const uint32_t base = ch * TELEMETRY_LIFT_CHANNELS_PER_AXIS;
+        values[base + 0U] = (float)g_lift_control_status.homed_position_ecd[ch];
+        values[base + 1U] = (float)g_lift_control_status.axis_target_ecd[ch];
+        values[base + 2U] = g_lift_control_status.axis_final_current[ch];
+        values[base + 3U] = g_lift_control_status.axis_speed_ecd_s[ch];
+        values[base + 4U] = g_lift_control_status.axis_target_speed_ecd_s[ch];
+        values[base + 5U] = g_lift_control_status.axis_limit_now[ch];
+        values[base + 6U] = (float)g_lift_control_status.axis_feedback_current[ch];
+    }
+    taskEXIT_CRITICAL();
+    (void)memcpy(telemetry_frame, values, sizeof(values));
+    return sizeof(values);
+}
+
 /** 周期性发送一路波形帧；DMA 忙时丢弃本周期，不阻塞控制任务。 */
 static void telemetry_task(void *argument)
 {
@@ -110,6 +136,11 @@ static void telemetry_task(void *argument)
             uint32_t payload;
 
             if (g_telemetry_status.source ==
+                (uint8_t)TELEMETRY_SOURCE_LIFT_CONTROL)
+            {
+                payload = telemetry_build_lift_control_frame();
+            }
+            else if (g_telemetry_status.source ==
                 (uint8_t)TELEMETRY_SOURCE_LIFT)
             {
                 payload = telemetry_build_lift_frame();

@@ -2,6 +2,19 @@
 
 #include <stddef.h>
 
+/*
+ * ⚠️ 本模块【已被 lift_kinematics 取代】（2026-10-11），实现刻意保持不变：
+ *
+ *   · 它是"丝杆导程"模型，而实车是齿轮齿条（无导程这个量）；
+ *   · 它从来没有被固件调用过；
+ *   · 但它有 144 项主机测试钉着，可以当【独立的第二套验算途径】用 ——
+ *     同一个 total_ecd 用两套模型换算，两边一致说明至少算术没写错。
+ *
+ * 所以：不要在固件里新调用它，也不要顺手改它的公式去"对齐"机构。
+ * 真正的换算在 lift_kinematics.c，而且已经接进 lift_control_task 了。
+ * 详见 lift_geometry.h 的说明。
+ */
+
 /** int64 饱和到 int32。 */
 static int32_t geometry_sat_i32(int64_t value)
 {

@@ -26,6 +26,9 @@
 #define ROBOT_LIFT_MOTOR_2_ID             0x202U
 #define ROBOT_LIFT_MOTOR_3_ID             0x203U
 #define ROBOT_LIFT_MOTOR_4_ID             0x204U
+/* 2026-10-13 实车确认：ch0/ch1 前辅助轮，ch2/ch3 后麦轮。 */
+#define ROBOT_LIFT_FRONT_MASK             0x03U
+#define ROBOT_LIFT_REAR_MASK              0x0CU
 
 /* Pitch 改为 GM6020，走标准 DJI 帧：反馈 0x205，命令 0x1FF 槽 1（电压量纲）。 */
 #define ROBOT_PITCH_MOTOR_ID               0x205U

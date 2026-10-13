@@ -38,7 +38,9 @@ typedef enum
     LIFT_HOMING_STATE_SEEK,
     LIFT_HOMING_STATE_BACKOFF,
     LIFT_HOMING_STATE_DONE,
-    LIFT_HOMING_STATE_FAULT
+    LIFT_HOMING_STATE_FAULT,
+    LIFT_HOMING_STATE_CONTACT_WAIT,  /* 接触候选：停止出力，等操作手确认 */
+    LIFT_HOMING_STATE_CONTACT_STOP   /* 接触已确认：停止出力，等速度稳定 */
 } lift_homing_state_t;
 
 typedef enum
@@ -48,7 +50,8 @@ typedef enum
     LIFT_HOMING_FAULT_PREPOSITION_TIMEOUT, /* 前置段走不到位（顶住/卡住/电流太小） */
     LIFT_HOMING_FAULT_SEEK_TIMEOUT,      /* 超时仍未碰到死点（行程不够/被卡住） */
     LIFT_HOMING_FAULT_BACKOFF_TIMEOUT,   /* 碰到死点却退不出来（顶死/卡死） */
-    LIFT_HOMING_FAULT_ABORTED            /* 被上层主动中止 */
+    LIFT_HOMING_FAULT_ABORTED,           /* 被上层主动中止 */
+    LIFT_HOMING_FAULT_CONTACT_TIMEOUT   /* 等待接触确认或停止超时 */
 } lift_homing_fault_t;
 
 typedef struct

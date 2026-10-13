@@ -2,6 +2,39 @@
 
 #include <stddef.h>
 
+static float pid_window(float value, float lower, float upper)
+{
+    return value < lower ? lower : (value > upper ? upper : value);
+}
+
+float pid_calculate_limited(pid_controller_t *pid, float target,
+    float measurement, float dt_seconds, float lower, float upper)
+{
+    float before, candidate, raw, delta;
+    if (pid == NULL || dt_seconds <= 0.0F || lower > upper)
+        return 0.0F;
+    before = pid->integral;
+    pid->error = target - measurement;
+    candidate = pid_window(before + pid->error * dt_seconds,
+        -pid->config.integral_limit, pid->config.integral_limit);
+    pid->p_output = pid->config.kp * pid->error;
+    pid->d_output = pid->initialized ? pid->config.kd *
+        (pid->error - pid->previous_error) / dt_seconds : 0.0F;
+    raw = pid->p_output + pid->config.ki * candidate + pid->d_output;
+    delta = pid->config.ki * (candidate - before);
+    /* Reject only integration that pushes farther into saturation. Reverse
+     * error can unwind an already saturated integral. */
+    if ((raw > upper && delta > 0.0F) || (raw < lower && delta < 0.0F))
+        candidate = before;
+    pid->integral = candidate;
+    pid->i_output = pid->config.ki * candidate;
+    raw = pid->p_output + pid->i_output + pid->d_output;
+    pid->output = pid_window(raw, lower, upper);
+    pid->previous_error = pid->error;
+    pid->initialized = true;
+    return pid->output;
+}
+
 /** 按正负对称限幅约束 PID 中的积分或最终输出。 */
 static float pid_clamp(float value, float limit)
 {

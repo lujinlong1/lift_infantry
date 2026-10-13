@@ -48,6 +48,107 @@ static void top_clear_modes(lift_sync_modes_t *modes)
     modes->warp = 0;
 }
 
+/* Contact with a load-bearing chassis is not a hard endstop. Seek only in
+ * positive lift coordinates with the existing low seek-current magnitude.
+ * A stall pauses motion; it must never establish a contact datum by itself. */
+static void top_update_contact_homing(lift_homing_t *h,
+    const lift_homing_input_t *in, bool confirmed, int16_t contact_current,
+    uint32_t confirm_timeout_ms,
+    lift_homing_output_t *out)
+{
+    const bool stopped =
+        (in->speed_rpm <= h->config.stall_speed_rpm) &&
+        ((int32_t)in->speed_rpm >= -(int32_t)h->config.stall_speed_rpm);
+
+    *out = (lift_homing_output_t){0};
+    if (in->start_request)
+    {
+        h->state = LIFT_HOMING_STATE_SEEK;
+        h->fault = LIFT_HOMING_FAULT_NONE;
+        h->start_position_ecd = in->position_ecd;
+        h->state_start_ms = in->now_ms;
+        h->stall_active = false;
+    }
+    if (!in->online)
+    {
+        h->state = LIFT_HOMING_STATE_FAULT;
+        h->fault = LIFT_HOMING_FAULT_OFFLINE;
+    }
+    /* Ignore confirmations supplied before seeking starts or after it ends. */
+    if (confirmed && ((h->state == LIFT_HOMING_STATE_SEEK) ||
+                      (h->state == LIFT_HOMING_STATE_CONTACT_WAIT)))
+    {
+        h->zero_ecd = in->position_ecd; /* actual confirmed contact, no backoff */
+        h->state = LIFT_HOMING_STATE_CONTACT_STOP;
+        h->state_start_ms = in->now_ms;
+        h->stall_active = false;
+    }
+    if (h->state == LIFT_HOMING_STATE_SEEK)
+    {
+        /* Pause on sustained zero speed even when initially at contact.
+         * No minimum-travel requirement is used to assert a physical datum. */
+        if (stopped)
+        {
+            if (!h->stall_active)
+            {
+                h->stall_active = true;
+                h->stall_start_ms = in->now_ms;
+            }
+            else if ((uint32_t)(in->now_ms - h->stall_start_ms) >=
+                     h->config.stall_hold_ms)
+            {
+                h->state = LIFT_HOMING_STATE_CONTACT_WAIT;
+                h->state_start_ms = in->now_ms;
+                h->stall_active = false;
+            }
+        }
+        else h->stall_active = false;
+
+        if ((h->state == LIFT_HOMING_STATE_SEEK) &&
+            ((uint32_t)(in->now_ms - h->state_start_ms) >=
+             h->config.seek_timeout_ms))
+        {
+            h->state = LIFT_HOMING_STATE_FAULT;
+            h->fault = LIFT_HOMING_FAULT_SEEK_TIMEOUT;
+        }
+    }
+    if (h->state == LIFT_HOMING_STATE_CONTACT_STOP)
+    {
+        if (stopped)
+        {
+            if (!h->stall_active)
+            {
+                h->stall_active = true;
+                h->stall_start_ms = in->now_ms;
+            }
+            else if ((uint32_t)(in->now_ms - h->stall_start_ms) >=
+                     h->config.stall_hold_ms)
+            {
+                h->state = LIFT_HOMING_STATE_DONE;
+                h->stall_active = false;
+            }
+        }
+        else h->stall_active = false;
+    }
+    if (((h->state == LIFT_HOMING_STATE_CONTACT_WAIT) ||
+         (h->state == LIFT_HOMING_STATE_CONTACT_STOP)) &&
+        ((uint32_t)(in->now_ms - h->state_start_ms) >= confirm_timeout_ms))
+    {
+        h->state = LIFT_HOMING_STATE_FAULT;
+        h->fault = LIFT_HOMING_FAULT_CONTACT_TIMEOUT;
+    }
+    out->state = h->state;
+    out->fault = h->fault;
+    out->zero_ecd = h->zero_ecd;
+    if (h->state == LIFT_HOMING_STATE_SEEK)
+    {
+        int32_t current = contact_current;
+        if (current < 0) current = 0;
+        if (current > h->config.current_limit) current = h->config.current_limit;
+        out->commanded_current = (int16_t)current;
+    }
+}
+
 void lift_top_init(lift_top_t *self, const lift_top_config_t *config)
 {
     uint32_t ch;
@@ -87,6 +188,66 @@ void lift_top_init(lift_top_t *self, const lift_top_config_t *config)
     self->homed = false;
 }
 
+/**
+ * @brief 顶层故障的停机动作。
+ *
+ * ★ 这是本项目最关键的一处安全修正（2026-10-11）。
+ *
+ * 修正前：状态一进 FAULT，这里无条件把四轴电流清零。
+ * 本机构【不自锁】（ADR-006），清零 = 齿条被车重反驱 = 车从当时的高度掉下来。
+ * 一个"保护"动作变成了"摔车"动作。
+ *
+ * 修正后：清零只是三种停机动作里的一种（CUT），而且只在【车确实有支撑】时
+ *         才允许选它。选择逻辑在 lift_safety_policy_for()，执行在
+ *         lift_stop_apply()，两边都是纯函数、都有单测。
+ *
+ * 本函数只负责"把执行结果落进四轴输出"，不做策略判断。
+ */
+static void top_apply_fault_stop(
+    const lift_top_t *self,
+    const lift_top_input_t *in,
+    int16_t output_current[LIFT_CHANNEL_COUNT],
+    bool *active)
+{
+    lift_stop_config_t stop_config;
+    lift_stop_state_t stop_state;
+    int32_t commanded[LIFT_CHANNEL_COUNT];
+    uint32_t ch;
+
+    stop_config = self->config.stop;
+    /* LOWER/HOLD 的电流也必须落在这份配置自己的上限里。 */
+    if ((self->config.guard.current_limit > 0) &&
+        (stop_config.current_limit > self->config.guard.current_limit))
+    {
+        stop_config.current_limit = self->config.guard.current_limit;
+    }
+
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        const int8_t direction = self->config.axis_direction[ch];
+
+        commanded[ch] = 0;
+        /* 输入是原始域，停机策略工作在【已找零逻辑域】。 */
+        stop_state.position_ecd[ch] = top_homed_from_raw(
+            direction, in->position_ecd[ch], self->zero_ecd[ch]);
+        stop_state.park_ecd[ch] = in->stop_target_ecd[ch];
+        stop_state.hold_ecd[ch] = stop_state.position_ecd[ch];
+    }
+
+    lift_stop_apply(in->fault_stop_action, &stop_config, &stop_state,
+                    commanded, active);
+
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+    {
+        /*
+         * 停机电流是【逻辑量纲】（正 = 抬升），出口要折回原始域，
+         * 与找零支路、控制支路的做法一致。
+         */
+        output_current[ch] = top_sat_i16(top_to_logical(
+            self->config.axis_direction[ch], commanded[ch]));
+    }
+}
+
 void lift_top_set_zero_now(
     lift_top_t *self,
     const int32_t raw_position[LIFT_CHANNEL_COUNT])
@@ -108,6 +269,7 @@ void lift_top_set_zero_now(
     }
 
     self->homed = true;
+    self->motion_command_seen = false;
     self->state = LIFT_TOP_STATE_READY;
     self->fault = LIFT_TOP_FAULT_NONE;
     lift_control_reset(&self->control);
@@ -126,6 +288,7 @@ void lift_top_reload_control(
     /* 只换控制与安全闸的参数，**保留** zero_ecd / homed / state。 */
     self->config.control = config->control;
     self->config.guard = config->guard;
+    self->config.stop = config->stop;
     lift_control_init(&self->control, &self->config.control);
     lift_guard_init(&self->guard, &self->config.guard);
 }
@@ -176,6 +339,9 @@ void lift_top_update(
     status->at_target = false;
     status->guard_state = self->guard.state;
     status->guard_fault = self->guard.fault;
+    status->stop_action = LIFT_STOP_CUT;
+    status->stop_active = false;
+    status->stop_capable = lift_stop_can_hold(&self->config.stop);
     /*
      * 找零支路不走控制层，这些量先清零，避免残留上一周期的值——
      * 一个只写不读的字段不会报错，但会让 Watch 窗口撒谎。
@@ -198,6 +364,14 @@ void lift_top_update(
     self->clear_last = in->clear_homing_request;
     self->reset_last = in->reset_request;
 
+    if (in->external_fault_request)
+    {
+        self->state = LIFT_TOP_STATE_FAULT;
+        self->fault = LIFT_TOP_FAULT_SEQUENCE;
+        lift_control_reset(&self->control);
+        goto emit;
+    }
+
     if (reset_rising)
     {
         self->fault = LIFT_TOP_FAULT_NONE;
@@ -211,6 +385,7 @@ void lift_top_update(
     if (clear_rising && (self->state != LIFT_TOP_STATE_FAULT))
     {
         self->homed = false;
+        self->motion_command_seen = false;
         self->state = LIFT_TOP_STATE_IDLE;
         for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
         {
@@ -228,6 +403,58 @@ void lift_top_update(
     /* 启动找零：只在未找零时响应，禁止在已找零状态下直接重新找零。 */
     if (homing_rising && !self->homed)
     {
+        const uint8_t mask = self->config.homing_known_zero_mask;
+        const uint8_t valid_mask = (uint8_t)((1U << LIFT_CHANNEL_COUNT) - 1U);
+
+        /* Validate the complete request before starting any motor. The
+         * encoder cannot prove contact with a mechanical minimum by itself. */
+        if (((mask & (uint8_t)~valid_mask) != 0U) ||
+            ((self->config.homing_contact_mask & (uint8_t)~valid_mask) != 0U) ||
+            ((self->config.homing_contact_mask & mask) != 0U) ||
+            ((self->config.homing_contact_mask != 0U) &&
+             ((self->config.homing_contact_current <= 0) ||
+              (self->config.homing_contact_confirm_timeout_ms == 0U))) ||
+            ((in->homing_known_zero_confirmed_mask & mask) != mask))
+        {
+            self->state = LIFT_TOP_STATE_FAULT;
+            self->fault = LIFT_TOP_FAULT_ZERO_UNCONFIRMED;
+            goto emit;
+        }
+        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+        {
+            if (!in->online[ch])
+            {
+                self->homing[ch].state = LIFT_HOMING_STATE_FAULT;
+                self->homing[ch].fault = LIFT_HOMING_FAULT_OFFLINE;
+                status->homing_state[ch] = LIFT_HOMING_STATE_FAULT;
+                status->homing_fault[ch] = LIFT_HOMING_FAULT_OFFLINE;
+                self->state = LIFT_TOP_STATE_FAULT;
+                self->fault = LIFT_TOP_FAULT_HOMING_FAILED;
+                goto emit;
+            }
+            if ((mask & (uint8_t)(1U << ch)) != 0U)
+            {
+                const int32_t speed = in->speed_rpm[ch];
+                if ((speed > self->config.homing.stall_speed_rpm) ||
+                    (speed < -(int32_t)self->config.homing.stall_speed_rpm))
+                {
+                    self->state = LIFT_TOP_STATE_FAULT;
+                    self->fault = LIFT_TOP_FAULT_ZERO_MOVING;
+                    goto emit;
+                }
+            }
+        }
+        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+        {
+            /* Reset start-edge history as well as faults for a clean retry. */
+            lift_homing_init(&self->homing[ch], &self->config.homing);
+            if ((mask & (uint8_t)(1U << ch)) != 0U)
+            {
+                lift_homing_force_done(&self->homing[ch],
+                    top_to_logical(self->config.axis_direction[ch],
+                                   in->position_ecd[ch]));
+            }
+        }
         self->state = LIFT_TOP_STATE_HOMING;
         self->fault = LIFT_TOP_FAULT_NONE;
     }
@@ -254,11 +481,27 @@ void lift_top_update(
             hin.speed_rpm = top_sat_i16(top_to_logical(
                 direction, (int32_t)in->speed_rpm[ch]));
             hin.online = in->online[ch];
-            hin.start_request = homing_rising;   /* 单周期脉冲 */
+            hin.start_request = homing_rising &&
+                ((self->config.homing_known_zero_mask &
+                  (uint8_t)(1U << ch)) == 0U);
             hin.abort_request = false;
             hin.now_ms = in->now_ms;
 
-            lift_homing_update(&self->homing[ch], &hin, &hout);
+            /* A zero established without motion still requires live feedback
+             * throughout front-axis homing; DONE must not mask a lost axis. */
+            if (!in->online[ch])
+            {
+                self->homing[ch].state = LIFT_HOMING_STATE_FAULT;
+                self->homing[ch].fault = LIFT_HOMING_FAULT_OFFLINE;
+            }
+            if ((self->config.homing_contact_mask & (uint8_t)(1U << ch)) != 0U)
+            {
+                top_update_contact_homing(&self->homing[ch], &hin,
+                    (in->homing_contact_confirmed_mask & (uint8_t)(1U << ch)) != 0U,
+                    self->config.homing_contact_current,
+                    self->config.homing_contact_confirm_timeout_ms, &hout);
+            }
+            else lift_homing_update(&self->homing[ch], &hin, &hout);
 
             status->homing_state[ch] = hout.state;
             status->homing_fault[ch] = hout.fault;
@@ -308,6 +551,7 @@ void lift_top_update(
                     direction, in->position_ecd[ch], self->zero_ecd[ch]);
             }
             self->homed = true;
+            self->motion_command_seen = false;
             self->state = LIFT_TOP_STATE_READY;
             lift_control_reset(&self->control);
             lift_guard_init(&self->guard, &self->config.guard);
@@ -330,6 +574,9 @@ void lift_top_update(
         int16_t logical_speed[LIFT_CHANNEL_COUNT];
         lift_guard_input_t gin;
         lift_guard_output_t gout;
+        lift_control_command_t effective = *command;
+
+        effective.enabled = command->enabled && in->command_fresh;
 
         /*
          * 模态限幅与重力前馈都在 lift_control 内部完成，这里传【已找零坐标】
@@ -351,10 +598,21 @@ void lift_top_update(
                 direction, (int32_t)in->speed_rpm[ch]));
         }
 
-        lift_control_update(
-            &self->control, status->homed_position_ecd, logical_speed,
-            command, &effort, &ctl_status);
-        lift_sync_distribute(&self->control.config.sync, &effort, cur32);
+        if (command->enabled && in->command_fresh)
+            self->motion_command_seen = true;
+        effort = (lift_sync_effort_t){0};
+        if (self->config.control.axis_control_enabled)
+        {
+            lift_control_update_axes(&self->control,
+                status->homed_position_ecd, logical_speed, &effective,
+                in->control_dt_s, cur32, &ctl_status);
+        }
+        else
+        {
+            lift_control_update(&self->control, status->homed_position_ecd,
+                logical_speed, &effective, &effort, &ctl_status);
+            lift_sync_distribute(&self->control.config.sync, &effort, cur32);
+        }
 
         for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
         {
@@ -364,11 +622,16 @@ void lift_top_update(
             gin.online[ch] = in->online[ch];
         }
         gin.homed = true;
-        gin.command_fresh = in->command_fresh;
+        /* No motion command has expired immediately after homing: none has
+         * been issued yet. Once armed, preserve the original timeout descent. */
+        gin.command_fresh = in->command_fresh || !self->motion_command_seen;
         gin.reset_request = reset_rising;
         gin.now_ms = in->now_ms;
 
         lift_guard_update(&self->guard, &gin, &gout);
+
+        if (self->config.control.axis_control_enabled)
+            lift_control_track_axes(&self->control, gout.output_current, &ctl_status);
 
         for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
         {
@@ -423,10 +686,28 @@ emit:
 
     if (self->state == LIFT_TOP_STATE_FAULT)
     {
-        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
-        {
-            status->output_current[ch] = 0;
-        }
+        /*
+         * ★ 故障态不再无条件清零。
+         *
+         * 停机动作由调用方按 lift_safety_policy_for() 决定并填进
+         * in->fault_stop_action；这里只负责执行。
+         *
+         * 为什么必须有这一层：本机构不自锁，"故障 = 断电"等于"故障 = 摔车"。
+         * 车悬空时要托住（HOLD）或受控下降（LOWER）；只有确认有机械支撑
+         * 或车已落地时才允许直接断电（CUT）。
+         */
+        bool active = false;
+
+        top_apply_fault_stop(self, in, status->output_current, &active);
+        status->stop_action = lift_stop_can_hold(&self->config.stop) ?
+            in->fault_stop_action : LIFT_STOP_CUT;
+        status->stop_active = active;
         status->at_target = false;
     }
+    else
+    {
+        status->stop_action = LIFT_STOP_CUT;
+        status->stop_active = false;
+    }
+    status->stop_capable = lift_stop_can_hold(&self->config.stop);
 }
