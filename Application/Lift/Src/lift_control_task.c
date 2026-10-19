@@ -8,6 +8,7 @@
 #include "lift_jog_task.h"
 #include "lift_kinematics.h"
 #include "lift_safety.h"
+#include "lift_lock.h"
 #include "lift_seq.h"
 #include "robot_motor_commands.h"
 #include "robot_motor_config.h"
@@ -17,7 +18,10 @@
 #include <stddef.h>
 #include <string.h>
 
-#define LIFT_CONTROL_TASK_STACK_WORDS       1024U
+/* Keil reports >=4208 bytes for this task's call chain. The old 4096-byte
+ * allocation was already too small, even before saved RTOS/FPU context.
+ * Keep headroom and run Tests/Lift/check_stack_budget.ps1 after target builds. */
+#define LIFT_CONTROL_TASK_STACK_WORDS       2048U
 #define LIFT_CONTROL_PERIOD_MS              5U
 
 /*
@@ -50,9 +54,9 @@
  * ⚠️ 这里的 1.0 是【编码器/速度换算】的传动比，**不是减速箱的减速比**。
  *
  * 已确认（2026-10-09）：电机是官网原装 M3508，**自带行星减速箱**，
- * 输出轴装驱动齿轮（齿条 200 mm 行程对应 150000 计数，见 LIFT_TRAVEL_MAX_ECD）。
+ * 输出轴装驱动齿轮（历史行程参数保留，当前真实行程须逐轴重测）。
  * ⚠️ 2026-10-11 实测后，**减速比按实测取 13.43**，不再用图纸的 19.2；
- *    换算的权威值是 750.0 计数/mm（见 lift_kinematics.h）。
+ *    历史换算值为 750.0 计数/mm，当前机构仍需重测（见 lift_kinematics.h）。
  *
  * 为什么这里仍是 1.0：C620 回报的 speed_rpm 与 total_ecd 都是**转子侧**，
  * 而 speed_is_rotor = false 表示"不再折算到负载侧"。
@@ -72,71 +76,16 @@
  * It does not derive gains or predict travel in the active axis path. */
 #define LIFT_ACTUATOR_GAIN_ECD_S_PER_CURRENT 0.5F
 
-/*
- * 行程（编码器计数，已找零坐标）。
- *
- * ⚠️ 零点方向已由用户实测确认（2026-10-09）：
- *     齿条向上缩 → 撞死点，此时车在**最低**位置 = 零点
- *     齿条向下伸 → 把车顶起来 = 高度增大
- *   所以零点在最低端，往上都是正的：MIN=0 是安全的。
- *   （若以后发现死点在最高端，整条区间要镜像——见调试手册 P4。）
- *
- * ⚠️ 2026-10-11 修正下限：原来是 -2000，低于机械死点。但 10.10 的实测结论是
- *   "零点是齿条顶死的最低点 ⇒ position_min = 0 才安全"。配在死点之下等于
- *   允许控制器往死点里推 2000 计数，受控缓降会一路顶死点然后报
- *   DESCENT_STALL。已改成 0。
- *
- * ★★ 2026-10-11 实测定案（用户手测，取代之前所有图纸推算）★★
- *
- *   缩回死点 → 伸出【硬限位】全程 = 150 000 计数 = 200 mm
- *   ⇒ 750.0 计数/mm（转子侧，单轴）
- *   ⇒ 齿轮转一圈 = 110 000 计数 = 146.7 mm 齿条位移
- *
- *   两条测量互相印证：110000 ÷ 150000 × 200 = 146.7 mm/圈，与单独测的
- *   "齿轮一圈 110000 计数"一致。所以这一组数采用，**不再参考图纸的 69 mm
- *   分度圆 / 19.2:1**（那套推出来是 725.7 计数/mm，偏小 3.2%，且与
- *   "一圈 146.7 mm" 直接冲突）。
- *
- *   由 146.7 mm/圈 + 13.43:1 反推，实际分度圆直径 ≈ 46.7 mm（而不是 69 mm）。
- *   这个数只用于让 lift_kinematics 的公式结构保持不变；**换算的权威是实测的
- *   750.0 计数/mm**，不是这个直径。
+/* Legacy configured logical count envelope, NOT evidence of current mechanical
+ * travel. 0..150000 and 750 counts/mm are retained to preserve control tuning.
+ * Contact reference (front) differs from a physical retracted endstop (rear).
+ * Measure each axis from its current datum, stops, loaded deflection and clearance
+ * before confirming travel_calibration_confirmed. No 200mm extension is inferred.
  */
 #define LIFT_TRAVEL_MIN_ECD                 0
-/*
- * ★ 上界 = 150000 = 伸出【硬限位】本身（用户 2026-10-11 指定）。
- *
- * 用户确认：零点是缩回死点，伸出端是硬限位，两者之间正好 150000 计数
- * = 200 mm。所以 0..150000 就是完整跨度，软限位取满，200 mm 成为
- * **可命令**的位置。
- *
- * ⚠️ 代价必须知道（不是我反对，是要你知道会看到什么）：
- *   软限位 = 硬限位 ⇒ 一旦目标给到 150000，位置环会**一直顶在铁挡块上**：
- *     · 位置误差永远差最后一点，积分会缓慢累积
- *     · 该轴电流会长时间停在「托住 + 顶住」的水平，温升持续
- *     · 不会自动报故障（堵转看门狗只判"该动却不动"，满目标时它不判"该动"）
- *   所以：**150000 只适合"顶一下建立基准点然后转保持电流"**，
- *   不适合让位置环长期停在 150000。
- *   日常"抬到 200 mm"的目标应留一点余量（见 LIFT_TRAVEL_MARGIN_ECD）。
- */
 #define LIFT_TRAVEL_MAX_ECD                 150000
-/*
- * 停放点（缓降停止位置，单轴计数）：零点上方一点点。
- * 缓降是"把车放下来"，放到机械死点前就该停——不能拿 MIN 当目标。
- */
 #define LIFT_TRAVEL_PARK_ECD                200
-/* 上电/未找零时的安全起点：不往上顶，先给一个确定的小高度。 */
 #define LIFT_TRAVEL_START_ECD               2000
-/*
- * 命令面余量（单轴计数）。
- *
- * 2026-10-11：800 → 1500。行程从 34 mm 变成 200 mm 之后，同样的绝对余量
- * 对应的相对余量小了 6 倍。伸出端是铁碰铁，命令面（遥控/流程）给目标时
- * 留 1500 计数（2 mm）的余量，避免"操作手推到顶"就等于"长期顶限位"。
- *
- * 注意：这只夹【命令面】。位置环本身的软限位是 LIFT_TRAVEL_MAX_ECD，
- * 也就是 150000 —— 需要"顶到硬限位建立基准"时，绕开命令面直接给力即可
- * （走 FORCE 模式或堵转找零），不靠位置环。
- */
 #define LIFT_TRAVEL_MARGIN_ECD              1500
 #define LIFT_LIMIT_ROLL_MAX_ECD             6000
 #define LIFT_LIMIT_PITCH_MAX_ECD            6000
@@ -161,7 +110,7 @@
 /*  量纲约定：控制器的模态量 = 四轴之和 = 单轴 × 4（转置伴随，不除 4）。  */
 /*  操作手想的是"每根齿条多少 mm/s"，所以下面按 mm/s 给，换算集中在这里。  */
 /*                                                                    */
-/*  ★ 机械换算（2026-10-11 实测定案，取代图纸推算）：                     */
+/*  历史暂定换算（保留数值，当前机构行程/零点必须重测确认）：            */
 /*      750.0 计数/mm（转子侧，单轴）                                   */
 /*      = 150000 计数 / 200 mm（缩回死点 → 伸出硬限位）                  */
 /*      齿轮一圈 = 110000 计数 = 146.7 mm                                */
@@ -337,6 +286,7 @@ lift_task_status_t g_lift_control_status;
 lift_seq_t g_lift_sequence;
 lift_seq_pub_t g_lift_seq_status;
 lift_fault_snapshot_t g_lift_fault_snapshot;
+lift_stall_snapshot_t g_lift_stall_snapshot;
 
 static lift_top_t lift_top;
 /*
@@ -354,6 +304,10 @@ static float lift_speed_loop_kp_max;
 static bool lift_safety_limited;
 static osThreadId_t lift_task_handle;
 static StaticTask_t lift_task_control;
+/* Single control-task staging frame, outside the task stack. */
+static lift_diag_frame_t lift_diag_frame;
+static uint32_t lift_diag_cycle, lift_diag_parameter_version, lift_diag_seen_failures;
+static uint32_t lift_diag_seen_owner_losses;
 static StackType_t lift_task_stack[LIFT_CONTROL_TASK_STACK_WORDS];
 
 /* ==================================================================== */
@@ -960,6 +914,34 @@ static void lift_set_default_debug(void)
  * **先撤销使能并使旧零点失效**，再重建整条链——这是刻意的：改了参数就不该
  * 继续拿旧零点去动机构。
  */
+static void lift_reject(lift_request_reject_t reason, int8_t axis)
+{
+    g_lift_control_status.request_reject = (uint8_t)reason;
+    g_lift_control_status.request_reject_axis = axis;
+    g_lift_control_status.request_reject_cycle_id = lift_diag_cycle;
+}
+static bool lift_boundary_edit_allowed(void)
+{
+    robot_motor_state_t motors;
+    uint32_t ch, now = osKernelGetTickCount();
+    if (lift_top.fault != LIFT_TOP_FAULT_NONE || lift_top.guard.state == LIFT_GUARD_STATE_FAULT ||
+        g_lift_sequence.state == LIFT_SEQ_STATE_FAULT)
+    { lift_reject(LIFT_REJECT_FAULT, -1); return false; }
+    if (g_lift_task_command.enabled || lift_top.state == LIFT_TOP_STATE_HOMING ||
+        lift_seq_is_active(&g_lift_sequence) || lift_owner_current() != LIFT_OWNER_NONE)
+    { lift_reject(LIFT_REJECT_BUSY, -1); return false; }
+    robot_motors_get_snapshot(&motors);
+    for (ch = 0U; ch < 4U; ch++)
+    {
+        if (!dji_motor_feedback_is_online(&motors.lift.motor[ch], now,
+            pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS)))
+        { lift_reject(LIFT_REJECT_OFFLINE, (int8_t)ch); return false; }
+        if ((int32_t)motors.lift.motor[ch].speed_rpm > 2 || (int32_t)motors.lift.motor[ch].speed_rpm < -2)
+        { lift_reject(LIFT_REJECT_MOVING, (int8_t)ch); return false; }
+    }
+    return true;
+}
+
 static void lift_apply_debug_parameters(bool invalidate_zero)
 {
     lift_control_debug_t debug;
@@ -977,6 +959,9 @@ static void lift_apply_debug_parameters(bool invalidate_zero)
         return;
     }
 
+    /* Runtime requests are checked by lift_handle_parameter_apply(). Startup
+     * calls this core directly, with no motor-feedback validation call chain. */
+    if (invalidate_zero) g_lift_control_debug.travel_calibration_confirmed = false;
     if (invalidate_zero)
     {
         taskENTER_CRITICAL();
@@ -1006,6 +991,7 @@ static void lift_apply_debug_parameters(bool invalidate_zero)
 
     lift_build_config(&config, &debug);
     lift_top_init(&lift_top, &config);
+    ++lift_diag_parameter_version;
     lift_build_kinematics(&debug);
     lift_configuration_applied = true;
     lift_configuration_rejected = false;
@@ -1025,6 +1011,17 @@ static void lift_apply_debug_parameters(bool invalidate_zero)
  * 而调 PID 时每改一次增益都重新找零是不可接受的。
  * 这两个走轻量路径，保留零点与 homed。
  */
+static void lift_handle_parameter_apply(void)
+{
+    if (!g_lift_control_debug.apply) return;
+    if (!lift_boundary_edit_allowed())
+    {
+        g_lift_control_debug.apply = false;
+        return;
+    }
+    lift_apply_debug_parameters(true);
+}
+
 static void lift_handle_light_commands(void)
 {
     uint8_t do_gains;
@@ -1047,6 +1044,11 @@ static void lift_handle_light_commands(void)
         return;
     }
 
+    if (lift_top.fault != LIFT_TOP_FAULT_NONE || lift_top.guard.state == LIFT_GUARD_STATE_FAULT ||
+        g_lift_sequence.state == LIFT_SEQ_STATE_FAULT)
+    { lift_reject(LIFT_REJECT_FAULT, -1); return; }
+    if (do_zero && (!lift_boundary_edit_allowed() || lift_top.state != LIFT_TOP_STATE_IDLE || lift_top.homed))
+    { if (lift_top.homed) lift_reject(LIFT_REJECT_DATUM, -1); return; }
     /* 取一份参数快照（含手动增益）；预设只在非手动模式下改 kp/ki/kd */
     lift_select_pid_preset(&g_lift_control_debug);
     taskENTER_CRITICAL();
@@ -1059,6 +1061,13 @@ static void lift_handle_light_commands(void)
         return;
     }
 
+    if (do_gains || do_zero)
+        for (ch = 0U; ch < 4U; ch++)
+            if (debug.axis_direction[ch] != lift_top.config.axis_direction[ch] ||
+                debug.axis_counts_per_mm[ch] != lift_top.config.control.counts_per_mm[ch] ||
+                debug.position_min_ecd[ch] != lift_top.config.control.limit_height_min_ecd[ch] ||
+                debug.position_max_ecd[ch] != lift_top.config.control.limit_height_max_ecd[ch])
+            { lift_reject(LIFT_REJECT_TRAVEL, (int8_t)ch); return; }
     lift_build_config(&config, &debug);
 
     if (do_zero != 0U)
@@ -1069,11 +1078,13 @@ static void lift_handle_light_commands(void)
             raw[ch] = motors.lift.motor[ch].total_ecd;
         }
         lift_top_set_zero_now(&lift_top, raw);
+        g_lift_control_debug.travel_calibration_confirmed = false;
         (void)memset(&lift_last_status, 0, sizeof(lift_last_status));
     }
     else
     {
         lift_top_reload_control(&lift_top, &config);
+        ++lift_diag_parameter_version;
     }
     lift_build_kinematics(&debug);
 
@@ -1085,12 +1096,12 @@ static void lift_handle_light_commands(void)
     g_lift_control_status.position_loop_kp = lift_position_loop_kp;
 }
 /* ==================================================================== */
-/*  3. 安全层：目标夹取与"自动下降找行程"                                */
+/*  3. 安全层：既有目标夹取（不证明机械行程或安全下降）                                */
 /*                                                                      */
 /*  为什么需要它：抬升的行程区间是【实测出来】的，上电时并不知道机构现在    */
 /*  伸到哪。如果一使能就按目标往上顶，而目标其实在行程之外，位置环会一直     */
 /*  顶到机械挡块（或不自锁机构被顶到极限）。这里做两件事：                  */
-/*    1. 目标超过上限时，把目标压回"起点 + 余量"（往下走是安全的）；        */
+/*    1. 目标超过上限时，把目标压回"起点 + 余量"（保留原有重定向行为，不构成安全证明）；        */
 /*    2. 未标定（K 或行程是占位值）时，只允许在起点附近低速试探。          */
 /* ==================================================================== */
 
@@ -1147,7 +1158,7 @@ static void lift_command_height_bounds(int32_t *minimum, int32_t *maximum)
  *
  * 两条硬规则：
  *   1. 目标 > 行程上限：不是夹到上限（那等于顶死），而是压回起点，让机构
- *      先往下走，去找一个确定的位置；这比"顶在极限等超时"安全得多。
+ *      先往下走，去找一个确定的位置；这是既有行为；下降路径和支撑仍须实机评估。
  *   2. 目标 < 行程下限：夹到下限 + 余量，绝不允许命令把机构往死点里推。
  */
 static bool lift_apply_safety(const lift_top_status_t *top_status)
@@ -1190,7 +1201,7 @@ static bool lift_apply_safety(const lift_top_status_t *top_status)
         {
             /*
              * 往上越界：压回起点而不是压到上限。机构此刻可能正顶在极限上，
-             * 唯一确定安全的方向是往下。
+             * 保留原有向下重定向；这不证明下降路径或支撑安全。
              */
             g_lift_task_command.target_height_ecd = start;
             limited = true;
@@ -1304,7 +1315,7 @@ static void lift_publish_status(
         top_status->control.error_height_ecd;
     /*
      * 故障停机动作（悬空不清零 / 落地才切断）与"能不能托住"的可见性。
-     * stop_capable 为 false 说明保持电流还没标定 —— **这是能力缺口**，
+     * stop_capable 始终为 false：未验证物理保持能力；输出配置另见诊断，
      * 一旦出故障就只能断电掉车，操作手必须知道。
      */
     g_lift_control_status.stop_action = (uint8_t)top_status->stop_action;
@@ -1446,8 +1457,6 @@ static void lift_publish_status(
     }
 }
 
-static bool lift_test_start_pending;
-static bool lift_stair_start_pending;
 static bool lift_stair_owned;
 static int32_t stair_distance[3], stair_speed[3];
 static int32_t stair_previous_ecd[4];
@@ -1458,14 +1467,34 @@ static int8_t stair_leg = -1;
 static uint32_t stair_motion_tick, stair_settle_tick;
 static bool stair_settling;
 
+static bool lift_stair_read_leg(int8_t leg)
+{
+    const int32_t distance = g_lift_control_debug.stair_distance_mm[leg];
+    const int32_t speed = g_lift_control_debug.stair_speed_mm_s[leg];
+    if (distance < 1 || distance > 2000 || speed < 10 || speed > 200)
+    {
+        g_lift_control_debug.stair_drive_input_result = 2U;
+        g_lift_control_debug.stair_drive_waiting_input = true;
+        return false;
+    }
+    stair_distance[leg] = distance;
+    stair_speed[leg] = speed;
+    g_lift_control_debug.stair_drive_target_mm = distance;
+    g_lift_control_debug.stair_drive_input_result = 1U;
+    g_lift_control_debug.stair_drive_waiting_input = false;
+    return true;
+}
+
 /* Called before the sequence update. Completion belongs only to the current
  * leg; pauses retain wheel progress, including coasting while paused. */
 static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
 {
     const lift_seq_state_t stage = g_lift_sequence.state;
-    const int8_t leg = stage == LIFT_SEQ_STATE_APPROACH_STEP ? 0 :
-        stage == LIFT_SEQ_STATE_ADVANCE_MIDDLE ? 1 :
-        stage == LIFT_SEQ_STATE_FINAL_ADVANCE ? 2 : -1;
+    const bool paused = stage == LIFT_SEQ_STATE_TEST_PAUSED;
+    const lift_seq_state_t drive_stage = paused ? g_lift_sequence.test_resume_state : stage;
+    const int8_t leg = drive_stage == LIFT_SEQ_STATE_APPROACH_STEP ? 0 :
+        drive_stage == LIFT_SEQ_STATE_ADVANCE_MIDDLE ? 1 :
+        drive_stage == LIFT_SEQ_STATE_FINAL_ADVANCE ? 2 : -1;
     bool stationary = true;
     float increment = 0.0F;
     uint32_t ch;
@@ -1476,6 +1505,7 @@ static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
         lift_last_status.fault != LIFT_TOP_FAULT_NONE)
     {
         g_lift_control_debug.test_pause = true;
+        g_lift_control_debug.test_resume = false;
         stair_velocity = 0.0F;
         return false;
     }
@@ -1495,6 +1525,12 @@ static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
         stair_progress = stair_last_progress = stair_velocity = 0.0F;
         stair_motion_tick = now;
         stair_settling = false;
+        g_lift_control_debug.stair_drive_target_mm = 0;
+        if (!lift_stair_read_leg(leg))
+        {
+            g_lift_control_debug.test_pause = true;
+            g_lift_control_debug.test_resume = false;
+        }
         for (ch = 0U; ch < 4U; ch++)
             stair_previous_ecd[ch] = motors->chassis.wheel[ch].total_ecd;
     }
@@ -1506,6 +1542,7 @@ static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
         {
             g_lift_control_debug.stair_drive_stop_reason = 1U;
             g_lift_control_debug.test_pause = true;
+            g_lift_control_debug.test_resume = false;
             stair_velocity = 0.0F;
             return false;
         }
@@ -1522,7 +1559,21 @@ static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
     if (stair_leg >= 0) stair_progress += increment / (4.0F * stair_counts_per_mm);
     g_lift_control_debug.stair_drive_progress_mm = (int32_t)stair_progress;
     g_lift_control_debug.stair_drive_leg = leg;
-    if (leg < 0 || g_lift_control_debug.test_pause ||
+    /* Read edits only on entry or an explicit paused resume. Never reset
+     * progress: the edited distance is measured from this leg's original start. */
+    if (paused && leg >= 0 && g_lift_control_debug.test_resume)
+    {
+        if (!stationary || g_lift_control_debug.test_pause ||
+            g_lift_control_debug.sequence_abort)
+        {
+            g_lift_control_debug.stair_drive_input_result = 3U;
+            g_lift_control_debug.test_resume = false;
+        }
+        else if (!lift_stair_read_leg(leg))
+            g_lift_control_debug.test_resume = false;
+    }
+    if (leg < 0) g_lift_control_debug.stair_drive_waiting_input = false;
+    if (leg < 0 || paused || g_lift_control_debug.test_pause ||
         g_lift_control_debug.sequence_abort)
     {
         stair_velocity = 0.0F;
@@ -1568,12 +1619,43 @@ static bool lift_stair_drive(const robot_motor_state_t *motors, uint32_t now)
     return false;
 }
 
+static bool lift_start_motor_ready(const dji_motor_feedback_t *motor,
+                                  uint32_t now, uint8_t group, uint32_t axis)
+{
+    const bool online = dji_motor_feedback_is_online(motor, now,
+        pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS));
+    if (online && motor->speed_rpm >= -2 && motor->speed_rpm <= 2)
+        return true;
+    g_lift_control_debug.test_start_reject_group = group;
+    g_lift_control_debug.test_start_reject_axis = (int8_t)axis;
+    g_lift_control_debug.test_start_reject_reason = !motor->initialized ? 1U :
+        !online ? 2U : 3U;
+    g_lift_control_debug.test_start_reject_rpm = motor->speed_rpm;
+    g_lift_control_debug.test_start_reject_age_ms = motor->initialized ?
+        (uint32_t)(now - motor->last_update_tick) * portTICK_PERIOD_MS : UINT32_MAX;
+    return false;
+}
+
+static bool lift_sequence_travel_ok(int32_t high_mm, int32_t low_mm, int8_t *bad_axis)
+{
+    uint32_t ch;
+    for (ch = 0U; ch < 4U; ch++)
+    {
+        int32_t high, low;
+        int64_t maximum = (int64_t)lift_top.config.control.limit_height_max_ecd[ch] -
+            lift_top.config.control.limit_margin_ecd;
+        if (!lift_kin_mm_to_ecd(&lift_kin, ch, high_mm, &high) ||
+            !lift_kin_mm_to_ecd(&lift_kin, ch, low_mm, &low) ||
+            low < lift_top.config.control.limit_height_min_ecd[ch] || high > maximum || high < low)
+        { if (bad_axis) *bad_axis = (int8_t)ch; return false; }
+    }
+    return true;
+}
 static void lift_handle_test_start(bool bench_owns)
 {
     bool requested;
     bool stair_requested;
     int32_t height_mm;
-    const bool was_pending = lift_test_start_pending;
     taskENTER_CRITICAL();
     requested = g_lift_control_debug.test_start;
     stair_requested = g_lift_control_debug.stair_start;
@@ -1581,15 +1663,17 @@ static void lift_handle_test_start(bool bench_owns)
     g_lift_control_debug.test_start = false;
     g_lift_control_debug.stair_start = false;
     taskEXIT_CRITICAL();
-    if (!requested && !stair_requested && !lift_test_start_pending) return;
+    if (!requested && !stair_requested) return;
+    g_lift_control_debug.test_start_reject_group = 0U;
+    g_lift_control_debug.test_start_reject_axis = -1;
+    g_lift_control_debug.test_start_reject_reason = 0U;
+    g_lift_control_debug.test_start_reject_rpm = 0;
+    g_lift_control_debug.test_start_reject_age_ms = 0U;
     if (requested && stair_requested)
     {
         g_lift_control_debug.test_start_result = 3U;
         return;
     }
-    if (was_pending) stair_requested = lift_stair_start_pending;
-    lift_test_start_pending = false;
-    lift_stair_start_pending = false;
     if (stair_requested)
     {
         robot_motor_state_t start_motors;
@@ -1605,7 +1689,7 @@ static void lift_handle_test_start(bool bench_owns)
             return;
         }
         for (ch = 0U; ch < 3U; ch++)
-            if (g_lift_control_debug.stair_distance_mm[ch] < 1 ||
+            if (g_lift_control_debug.stair_distance_mm[ch] < 0 ||
                 g_lift_control_debug.stair_distance_mm[ch] > 2000 ||
                 g_lift_control_debug.stair_speed_mm_s[ch] < 10 ||
                 g_lift_control_debug.stair_speed_mm_s[ch] > 200)
@@ -1622,10 +1706,8 @@ static void lift_handle_test_start(bool bench_owns)
             }
         robot_motors_get_snapshot(&start_motors);
         for (ch = 0U; ch < 4U; ch++)
-            if (!dji_motor_feedback_is_online(&start_motors.chassis.wheel[ch],
-                osKernelGetTickCount(), pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS)) ||
-                start_motors.chassis.wheel[ch].speed_rpm > 2 ||
-                start_motors.chassis.wheel[ch].speed_rpm < -2)
+            if (!lift_start_motor_ready(&start_motors.chassis.wheel[ch],
+                    osKernelGetTickCount(), 2U, ch))
             {
                 g_lift_control_debug.test_start_result = 9U;
                 return;
@@ -1646,62 +1728,15 @@ static void lift_handle_test_start(bool bench_owns)
         g_lift_control_debug.test_start_result = 5U;
         return;
     }
-    if (!lift_last_status.homed)
+    if (!lift_top.homed)
     {
-        robot_motor_state_t zero_motors;
-        int32_t zero_raw[LIFT_CHANNEL_COUNT];
-        uint32_t ch;
-        if (!g_lift_control_debug.test_auto_zero)
-        {
-            g_lift_control_debug.test_start_result = 2U;
-            return;
-        }
-        /* Software datum only: never clear a fault or interrupt another owner.
-         * Current pose is NOT evidence of a physical lower endpoint. */
-        if (lift_top.state != LIFT_TOP_STATE_IDLE ||
-            lift_top.fault != LIFT_TOP_FAULT_NONE ||
-            g_lift_sequence.state != LIFT_SEQ_STATE_IDLE)
-        {
-            g_lift_control_debug.test_start_result = 4U;
-            return;
-        }
-        robot_motors_get_snapshot(&zero_motors);
-        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
-        {
-            const dji_motor_feedback_t *motor = &zero_motors.lift.motor[ch];
-            if (!dji_motor_feedback_is_online(motor, osKernelGetTickCount(),
-                    pdMS_TO_TICKS(LIFT_CONTROL_COMMAND_TIMEOUT_MS)) ||
-                motor->speed_rpm > 2 || motor->speed_rpm < -2)
-            {
-                g_lift_control_debug.test_start_result = 7U;
-                return;
-            }
-            zero_raw[ch] = motor->total_ecd;
-        }
-        lift_top_set_zero_now(&lift_top, zero_raw);
-        (void)memset(&lift_last_status, 0, sizeof(lift_last_status));
-        lift_last_status.homed = true;
-        lift_last_status.state = LIFT_TOP_STATE_READY;
+        g_lift_control_debug.test_start_result = 2U;
+        lift_reject(LIFT_REJECT_DATUM, -1);
+        return; /* neither test_auto_zero nor stationary feedback proves a physical datum */
     }
     if (lift_seq_is_active(&g_lift_sequence))
     {
         g_lift_control_debug.test_start_result = 3U;
-        return;
-    }
-    /* A rejected PRECHECK has not issued a lifting command. Never reset a
-     * motion/guard fault, or restart an active sequence, with this shortcut. */
-    if (!was_pending && g_lift_sequence.state == LIFT_SEQ_STATE_FAULT &&
-        g_lift_sequence.fault == LIFT_SAFETY_FAULT_LIMIT &&
-        g_lift_sequence.fault_detail != NULL &&
-        strcmp(g_lift_sequence.fault_detail,
-               "axis already outside soft limits") == 0 &&
-        lift_last_status.guard_state != LIFT_GUARD_STATE_FAULT)
-    {
-        g_lift_control_debug.sequence_reset = true;
-        g_lift_task_command.reset_request = true;
-        lift_test_start_pending = true;
-        lift_stair_start_pending = stair_requested;
-        g_lift_control_debug.test_start_result = 1U;
         return;
     }
     if (g_lift_sequence.state != LIFT_SEQ_STATE_IDLE ||
@@ -1710,56 +1745,62 @@ static void lift_handle_test_start(bool bench_owns)
         lift_last_status.guard_state == LIFT_GUARD_STATE_FAULT)
     {
         g_lift_control_debug.test_start_result = 4U;
+        lift_reject(LIFT_REJECT_FAULT, -1);
         return;
     }
-    g_lift_sequence.config.clearance_mm = height_mm;
-    if (height_mm == 200 && g_lift_control_debug.test_extend_travel)
+    if (!g_lift_control_debug.sequence_layout_confirmed)
     {
-        lift_control_debug_t travel_debug;
-        lift_top_config_t travel_config;
-        uint32_t ch;
-        /* Provisional 200mm compensation, plus the latest ~10mm shortfall:
-         * prior front/rear 825/900 counts/mm scaled by 1.05. Absolute values
-         * prevent repeated expansion; custom calibration remains untouched. */
-        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
-            if (g_lift_control_debug.axis_counts_per_mm[ch] == 750.0F &&
-                g_lift_control_debug.position_max_ecd[ch] == 150000)
-            {
-                const bool front = (ROBOT_LIFT_FRONT_MASK & (1U << ch)) != 0U;
-                g_lift_control_debug.axis_counts_per_mm[ch] = front ? 866.25F : 945.0F;
-                g_lift_control_debug.position_max_ecd[ch] = front ? 173250 : 189000;
-            }
-        travel_debug = g_lift_control_debug;
-        lift_build_config(&travel_config, &travel_debug);
-        lift_top_reload_control(&lift_top, &travel_config);
-        lift_build_kinematics(&travel_debug);
+        g_lift_control_debug.test_start_result = 10U;
+        lift_reject(LIFT_REJECT_LAYOUT, -1); return;
     }
+    {
+        int8_t bad = -1;
+        if (!g_lift_control_debug.travel_calibration_confirmed || g_lift_control_debug.test_extend_travel ||
+            !lift_sequence_travel_ok(height_mm, stair_requested ? g_lift_control_debug.stair_retracted_mm : 2, &bad))
+        {
+            g_lift_control_debug.test_start_result = 11U;
+            lift_reject(LIFT_REJECT_TRAVEL, bad); return;
+        }
+    }
+    {
+        robot_motor_state_t start_motors;
+        uint32_t ch;
+        robot_motors_get_snapshot(&start_motors);
+        for (ch = 0U; ch < 4U; ch++)
+            if (!lift_start_motor_ready(&start_motors.lift.motor[ch], osKernelGetTickCount(), 1U, ch))
+            {
+                g_lift_control_debug.test_start_result = 7U;
+                lift_reject(g_lift_control_debug.test_start_reject_reason == 3U ? LIFT_REJECT_MOVING : LIFT_REJECT_OFFLINE, (int8_t)ch);
+                return;
+            }
+    }
+    g_lift_sequence.config.clearance_mm = height_mm;
     g_lift_sequence.config.lift_test_only = !stair_requested;
     g_lift_sequence.config.stair_debug_run = stair_requested;
     g_lift_sequence.config.contact_mm = stair_requested ?
         g_lift_control_debug.stair_contact_mm : 8;
     g_lift_sequence.config.retracted_mm = stair_requested ?
         g_lift_control_debug.stair_retracted_mm : 2;
+    ++lift_diag_parameter_version; /* accepted sequence preset revision */
     if (stair_requested)
     {
         uint32_t ch;
-        for (ch = 0U; ch < 3U; ch++)
-        {
-            stair_distance[ch] = g_lift_control_debug.stair_distance_mm[ch];
-            stair_speed[ch] = g_lift_control_debug.stair_speed_mm_s[ch];
-        }
         for (ch = 0U; ch < 4U; ch++)
             stair_direction[ch] = g_chassis_control_debug.motor_direction[ch];
         stair_counts_per_mm = 8192.0F * g_chassis_control_debug.rpm_per_mps / 60000.0F;
         stair_leg = -1;
         stair_progress = 0.0F;
+        g_lift_control_debug.stair_drive_leg = -1;
+        g_lift_control_debug.stair_drive_progress_mm = 0;
+        g_lift_control_debug.stair_drive_target_mm = 0;
+        g_lift_control_debug.stair_drive_input_result = 0U;
+        g_lift_control_debug.stair_drive_waiting_input = false;
         g_lift_control_debug.stair_drive_stop_reason = 0U;
         g_lift_control_debug.stair_retracted_mask = 0U;
         lift_stair_owned = true;
         chassis_control_stair_velocity(0.0F);
     }
-    /* This machine's front=ch0/ch1, rear=ch2/ch3 is physically confirmed. */
-    g_lift_control_debug.sequence_layout_confirmed = true;
+    /* Layout confirmation is exclusively an operator input. */
     g_lift_control_debug.sequence_drive_done = false;
     g_lift_control_debug.sequence_confirm = false;
     g_lift_control_debug.sequence_release = false;
@@ -1770,6 +1811,185 @@ static void lift_handle_test_start(bool bench_owns)
     g_lift_control_debug.test_resume = false;
     g_lift_control_debug.test_lower = false;
     g_lift_control_debug.test_start_result = 1U;
+}
+
+static void lift_diag_reason(lift_diag_frame_t *frame, lift_diag_reason_t reason, int8_t axis)
+{
+    frame->reasons |= LIFT_DIAG_BIT(reason);
+    if (frame->reason_axis[reason] < 0) frame->reason_axis[reason] = axis;
+}
+
+/* Gather exclusively from this iteration's input/output and the atomic device
+ * snapshots. Sequence supervision of prior output is labelled separately. */
+static void lift_collect_diagnostics(const lift_top_status_t *top,
+    const lift_top_input_t *input, const lift_control_command_t *effective,
+    const lift_task_command_t *command, const robot_motor_state_t *motors,
+    const int16_t applied[4], uint8_t gate, uint32_t now)
+{
+    lift_diag_frame_t *frame = &lift_diag_frame;
+    uint32_t ch;
+    const bool demand = command->enabled || command->homing_request ||
+        lift_seq_is_active(&g_lift_sequence) || top->fault != LIFT_TOP_FAULT_NONE;
+    for (ch = 0U; ch < LIFT_DIAG_REASON_COUNT; ++ch) frame->reason_axis[ch] = -1;
+    frame->safety.reject = g_lift_control_status.request_reject;
+    frame->safety.reject_axis = g_lift_control_status.request_reject_axis;
+    frame->safety.reject_cycle_id = g_lift_control_status.request_reject_cycle_id;
+    frame->safety.recovery_blocked |= top->recovery_blocked;
+    frame->safety.requested_action = (uint8_t)top->requested_stop_action;
+    frame->safety.output_configured = top->stop_output_configured;
+    frame->safety.physically_verified = false;
+    frame->safety.tests_inhibited = lift_owner_tests_inhibited();
+    frame->safety.stop_inhibited = top->stop_inhibited;
+    frame->safety.travel_confirmed = g_lift_control_debug.travel_calibration_confirmed;
+    frame->safety.output_zero = true;
+    for (ch = 0U; ch < 4U; ch++)
+    {
+        frame->safety.datum_kind[ch] = top->datum_kind[ch];
+        if (applied[ch]) frame->safety.output_zero = false;
+    }
+    if (top->fault == LIFT_TOP_FAULT_ZERO_UNCONFIRMED || top->fault == LIFT_TOP_FAULT_ZERO_MOVING)
+        frame->safety.reason = LIFT_STOP_REASON_DATUM;
+    else if (top->fault == LIFT_TOP_FAULT_STATE) frame->safety.reason = LIFT_STOP_REASON_STATE;
+    else if (top->fault == LIFT_TOP_FAULT_HOMING_FAILED) frame->safety.reason = LIFT_STOP_REASON_HOMING;
+    else if (top->guard_fault == LIFT_GUARD_FAULT_DESCENT_STALL || g_lift_sequence.test_stall_axis >= 0)
+        frame->safety.reason = LIFT_STOP_REASON_STALL;
+    else if (top->guard_fault == LIFT_GUARD_FAULT_OFFLINE || gate == LIFT_OUTPUT_GATE_OFFLINE)
+        frame->safety.reason = LIFT_STOP_REASON_OFFLINE;
+    else if (top->guard_fault != LIFT_GUARD_FAULT_NONE) frame->safety.reason = LIFT_STOP_REASON_GUARD;
+    else if (g_lift_sequence.fault == LIFT_SAFETY_FAULT_ABORTED) frame->safety.reason = LIFT_STOP_REASON_ABORT;
+    else if (g_lift_sequence.state == LIFT_SEQ_STATE_FAULT) frame->safety.reason = LIFT_STOP_REASON_SEQUENCE;
+    else if (gate == LIFT_OUTPUT_GATE_TRAVEL) frame->safety.reason = LIFT_STOP_REASON_BOUNDARY;
+    else if (top->guard_state == LIFT_GUARD_STATE_DESCENDING || top->guard_state == LIFT_GUARD_STATE_PARKED)
+        frame->safety.reason = command->enabled ? LIFT_STOP_REASON_TIMEOUT : LIFT_STOP_REASON_DISABLED;
+    else if (!effective->enabled) frame->safety.reason = LIFT_STOP_REASON_DISABLED;
+    if (frame->safety.reject && frame->safety.reject_cycle_id == frame->cycle_id)
+        lift_diag_reason(frame, LIFT_DIAG_REQUEST_REJECT, frame->safety.reject_axis);
+    frame->parameter_version = lift_diag_parameter_version;
+    frame->dt_s = input->control_dt_s;
+    frame->command_tick_ms = command->command_update_tick * portTICK_PERIOD_MS;
+    frame->command_age_ms = (uint32_t)(now - command->command_update_tick) * portTICK_PERIOD_MS;
+    frame->command_enabled = effective->enabled;
+    frame->command_fresh = input->command_fresh;
+    frame->source = command->diagnostic_source;
+    if (command->homing_request || top->state == LIFT_TOP_STATE_HOMING)
+        frame->source = LIFT_DIAG_SOURCE_HOMING;
+    else if (lift_seq_is_active(&g_lift_sequence)) frame->source = LIFT_DIAG_SOURCE_SEQUENCE;
+    if (gate == LIFT_OUTPUT_GATE_JOG) frame->source = LIFT_DIAG_SOURCE_JOG;
+    if (gate == LIFT_OUTPUT_GATE_CAN_TEST) frame->source = LIFT_DIAG_SOURCE_CAN_TEST;
+    frame->command_axis_valid = effective->axis_targets_valid;
+    frame->command_modal_target[0] = effective->target_height_ecd;
+    frame->command_modal_target[1] = effective->target_roll_ecd;
+    frame->command_modal_target[2] = effective->target_pitch_ecd;
+    frame->state = (uint8_t)top->state;
+    frame->top_fault = (uint8_t)top->fault;
+    frame->stage = (uint8_t)g_lift_sequence.state;
+    frame->sequence_fault = (uint8_t)g_lift_sequence.fault;
+    frame->sequence_fault_axis = (int8_t)g_lift_sequence.fault_axis;
+    frame->sequence_detail = g_lift_sequence.fault_detail;
+    frame->guard_state = (uint8_t)top->guard_state;
+    frame->guard_fault = (uint8_t)top->guard_fault;
+    frame->guard_fault_axis = top->guard_fault_axis;
+    frame->gate = gate;
+    frame->stop_action = (uint8_t)top->stop_action;
+    frame->controller_ran = top->controller_ran;
+    frame->guard_ran = top->guard_ran;
+    frame->safety_limited = lift_safety_limited;
+    frame->retracted_mask = g_lift_control_debug.stair_retracted_mask;
+    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ++ch)
+    {
+        const dji_motor_feedback_t *feedback = &motors->lift.motor[ch];
+        lift_diag_axis_t *axis = &frame->axis[ch];
+        axis->direction = lift_top.config.axis_direction[ch];
+        frame->command_axis_target[ch] = effective->axis_target_ecd[ch];
+        axis->target_ecd = top->control.axis_target_ecd[ch];
+        axis->reference_ecd = top->control.axis_reference_ecd[ch];
+        axis->position_raw = input->position_ecd[ch];
+        axis->zero_raw = lift_top.zero_ecd[ch];
+        axis->position_ecd = (int32_t)((int64_t)axis->direction *
+            ((int64_t)input->position_ecd[ch] - lift_top.zero_ecd[ch]));
+        axis->target_speed_ecd_s = top->control.axis_target_speed_ecd_s[ch];
+        axis->actual_speed_ecd_s = (float)axis->direction *
+            lift_control_speed_to_ecd_s(&lift_top.config.control, input->speed_rpm[ch]);
+        axis->pid_current = top->control.axis_current_demand[ch] -
+                            top->control.axis_feedforward_current[ch];
+        axis->feedforward_current = top->control.axis_feedforward_current[ch];
+        axis->demand_current = top->control.axis_current_demand[ch];
+        axis->limit_current = (float)top->limited_current[ch];
+        axis->current_limit = top->control.axis_limit_now[ch];
+        axis->guard_current = top->guard_current[ch];
+        axis->protected_current = (int16_t)(axis->direction * top->output_current[ch]);
+        axis->submitted_raw = applied[ch]; /* valid write only if cache_written */
+        axis->feedback_raw = feedback->given_current;
+        axis->feedback_current = (int32_t)axis->direction * feedback->given_current;
+        axis->speed_raw_rpm = input->speed_rpm[ch];
+        axis->homing_state = (uint8_t)top->homing_state[ch];
+        axis->homing_fault = (uint8_t)top->homing_fault[ch];
+        axis->limit_blocked = top->limit_blocked[ch];
+        axis->online = input->online[ch];
+        axis->feedback_seen = feedback->initialized;
+        axis->feedback_tick_ms = feedback->last_update_tick * portTICK_PERIOD_MS;
+        axis->feedback_age_ms = feedback->initialized ?
+            (uint32_t)(frame->feedback_observed_ms - axis->feedback_tick_ms) : UINT32_MAX;
+        axis->feedback_count = feedback->update_count;
+        if (axis->homing_fault != LIFT_HOMING_FAULT_NONE)
+            lift_diag_reason(frame, LIFT_DIAG_HOMING, (int8_t)ch);
+        if (axis->homing_state == LIFT_HOMING_STATE_CONTACT_WAIT)
+            lift_diag_reason(frame, LIFT_DIAG_STALL, (int8_t)ch);
+        if (!axis->online && demand)
+            lift_diag_reason(frame, LIFT_DIAG_FEEDBACK, (int8_t)ch);
+        if (axis->limit_blocked) lift_diag_reason(frame, LIFT_DIAG_LIMIT, (int8_t)ch);
+    }
+    if (top->fault != LIFT_TOP_FAULT_NONE)
+        lift_diag_reason(frame, LIFT_DIAG_TOP, top->fault_axis);
+    if (top->guard_fault != LIFT_GUARD_FAULT_NONE)
+        lift_diag_reason(frame, LIFT_DIAG_GUARD, top->guard_fault_axis);
+    if (top->guard_fault == LIFT_GUARD_FAULT_DESCENT_STALL)
+        lift_diag_reason(frame, LIFT_DIAG_STALL, top->guard_fault_axis);
+    if (top->guard_state == LIFT_GUARD_STATE_DESCENDING ||
+        top->guard_state == LIFT_GUARD_STATE_PARKED)
+        lift_diag_reason(frame, LIFT_DIAG_COMMAND_TIMEOUT, -1);
+    if (g_lift_sequence.state == LIFT_SEQ_STATE_FAULT)
+        lift_diag_reason(frame, LIFT_DIAG_SEQUENCE, frame->sequence_fault_axis);
+    if (g_lift_sequence.state == LIFT_SEQ_STATE_TEST_PAUSED &&
+        g_lift_sequence.test_stall_axis >= 0)
+        lift_diag_reason(frame, LIFT_DIAG_STALL, (int8_t)g_lift_sequence.test_stall_axis);
+    if (gate != LIFT_OUTPUT_GATE_NONE && demand)
+        lift_diag_reason(frame, LIFT_DIAG_GATE, -1);
+    if (frame->owner_conflict)
+    {
+        frame->owner_requester = (uint8_t)LIFT_OWNER_CONTROL;
+        frame->owner_event_cycle_id = frame->cycle_id;
+    }
+    /* Reuse the bench module's loss counter; its event has a timestamp but
+     * no main-controller cycle. Two scalars, never copy the full jog status. */
+    taskENTER_CRITICAL();
+    frame->jog_owner_lost_count = g_lift_jog_status.own_lost_count;
+    frame->jog_owner_event_ms = g_lift_jog_status.own_lost_tick_ms;
+    if (!frame->owner_conflict && frame->jog_owner_lost_count != lift_diag_seen_owner_losses)
+    {
+        frame->owner_event_ms = frame->jog_owner_event_ms;
+        frame->owner_requester = (uint8_t)LIFT_OWNER_JOG;
+        frame->owner_conflict = true;
+    }
+    taskEXIT_CRITICAL();
+    lift_diag_seen_owner_losses = frame->jog_owner_lost_count;
+    if (frame->owner_conflict) lift_diag_reason(frame, LIFT_DIAG_OWNER, -1);
+    frame->transport_valid = lift_diag_get_transport(&frame->transport);
+    frame->transport_observed_ms = osKernelGetTickCount() * portTICK_PERIOD_MS;
+    if (frame->transport_valid)
+    {
+        const lift_diag_transport_t *tx = &frame->transport;
+        /* The counter catches a failed send even if a later send succeeded
+         * between two 5ms controller updates. Failure evidence has own cycle. */
+        if (tx->failed_count != lift_diag_seen_failures || tx->consecutive_failures != 0U)
+            frame->can_fault_bits |= LIFT_DIAG_CAN_SEND_FAILURE;
+        if (tx->timed_out) frame->can_fault_bits |= LIFT_DIAG_CAN_CACHE_EXPIRED;
+        if (demand && lift_diag_cycle > 4U && (tx->tx_count == 0U ||
+            (uint32_t)(frame->transport_observed_ms - tx->tx_tick_ms) >= 20U))
+            frame->can_fault_bits |= LIFT_DIAG_CAN_TX_SILENT;
+        if (frame->can_fault_bits != 0U) lift_diag_reason(frame, LIFT_DIAG_CAN, -1);
+        lift_diag_seen_failures = tx->failed_count;
+    }
 }
 
 static void lift_control_task(void *argument)
@@ -1798,17 +2018,23 @@ static void lift_control_task(void *argument)
          * 这一组电流是否被别的模块占用（台架点动 / CAN 测试）。
          * 占用期间主链完全不下发，也不能把这些周期当成"命令超时"。
          */
-        const bool bench_owns =
-            g_dji_can_test_status.running ||
-            g_dji_can_test_status.zero_holding ||
-            g_lift_jog_status.running;
+        const bool bench_owns = !lift_owner_tests_inhibited() &&
+            (g_dji_can_test_status.running ||
+             g_dji_can_test_status.zero_holding ||
+             g_lift_jog_status.running);
         bool all_online = true;
         uint32_t ch;
 
+        ++lift_diag_cycle;
+        if (lift_diag_cycle == 0U) ++lift_diag_cycle; /* reserve 0 for unknown */
+        (void)memset(&lift_diag_frame, 0, sizeof(lift_diag_frame));
+        lift_diag_frame.cycle_id = lift_diag_cycle;
+        lift_diag_frame.tick_ms = now * portTICK_PERIOD_MS;
+        lift_diag_frame.decision_feedback_cycle_id = g_lift_diag.frame.cycle_id;
         lift_owner_tick(now);
 
         /* 调试器改了参数：先撤销使能、让旧零点失效，再重建整条链。 */
-        lift_apply_debug_parameters(true);
+        lift_handle_parameter_apply();
         /* 轻量命令：只重载增益 / 软零点（都不作废旧零点）。 */
         lift_handle_light_commands();
         lift_handle_test_start(bench_owns);
@@ -1824,6 +2050,7 @@ static void lift_control_task(void *argument)
         }
         lift_snapshot_command(&command);
         robot_motors_get_snapshot(&motors);
+        lift_diag_frame.feedback_observed_ms = osKernelGetTickCount() * portTICK_PERIOD_MS;
 
         input.now_ms = now;
         input.control_dt_s = previous_tick == 0U ? lift_top.config.control.period_s :
@@ -1870,15 +2097,20 @@ static void lift_control_task(void *argument)
             lift_seq_status_t sst;
             const lift_seq_state_t stage_before = g_lift_sequence.state;
             const uint32_t stage_start_before = g_lift_sequence.step_start_ms;
+            lift_diag_frame.stage_before = (uint8_t)stage_before;
             int32_t targets_before[LIFT_CHANNEL_COUNT];
 
             for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+            {
                 targets_before[ch] = g_lift_sequence.axis_target_mm[ch];
+                lift_diag_frame.sequence_target_mm_before[ch] = targets_before[ch];
+            }
 
             (void)memset(&sin, 0, sizeof(sin));
             sin.now_ms = now;
             sin.homed = lift_last_status.homed;
-            sin.calibrated = lift_kin_ok;
+            sin.calibrated = lift_kin_ok && g_lift_control_debug.travel_calibration_confirmed &&
+                lift_sequence_travel_ok(g_lift_sequence.config.clearance_mm, g_lift_sequence.config.retracted_mm, NULL);
             sin.layout_confirmed = g_lift_control_debug.sequence_layout_confirmed;
             sin.guard_fault = (lift_last_status.guard_state ==
                                LIFT_GUARD_STATE_FAULT);
@@ -1950,6 +2182,10 @@ static void lift_control_task(void *argument)
             sin.confirm_request = g_lift_control_debug.sequence_confirm;
             sin.release_request = g_lift_control_debug.sequence_release;
             sin.reset_request = g_lift_control_debug.sequence_reset;
+            sin.motion_command_disabled = !command.enabled;
+            sin.recovery_confirmed = g_lift_control_debug.fault_recovery_confirmed;
+            input.recovery_confirmed = sin.recovery_confirmed;
+            g_lift_control_debug.fault_recovery_confirmed = false;
             sin.test_pause_request = g_lift_control_debug.test_pause;
             sin.test_resume_request = g_lift_control_debug.test_resume;
             sin.test_lower_request = g_lift_control_debug.test_lower;
@@ -1964,12 +2200,44 @@ static void lift_control_task(void *argument)
             taskEXIT_CRITICAL();
 
             lift_seq_update(&g_lift_sequence, &sin, &sst);
+            lift_diag_frame.safety.recovery_blocked = sst.recovery_blocked;
+            if (sst.recovery_blocked) lift_reject(LIFT_REJECT_RECOVERY, -1);
             if (lift_stair_owned && (sst.state != stage_before || bench_owns ||
                 lift_last_status.fault != LIFT_TOP_FAULT_NONE))
                 chassis_control_stair_velocity(0.0F);
             if (stage_before != LIFT_SEQ_STATE_TEST_PAUSED &&
                 sst.state == LIFT_SEQ_STATE_TEST_PAUSED)
             {
+                if (g_lift_sequence.test_stall_axis >= 0)
+                {
+                    taskENTER_CRITICAL();
+                    g_lift_stall_snapshot.valid = false;
+                    g_lift_stall_snapshot.count++;
+                    g_lift_stall_snapshot.tick_ms = now;
+                    g_lift_stall_snapshot.feedback_cycle_id = lift_diag_cycle;
+                    g_lift_stall_snapshot.control_evidence_cycle_id =
+                        lift_diag_frame.decision_feedback_cycle_id;
+                    g_lift_stall_snapshot.stage = (uint8_t)stage_before;
+                    g_lift_stall_snapshot.axis = g_lift_sequence.test_stall_axis;
+                    g_lift_stall_snapshot.stair_run = g_lift_sequence.config.stair_debug_run;
+                    g_lift_stall_snapshot.output_gate = g_lift_control_status.output_gate;
+                    for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+                    {
+                        g_lift_stall_snapshot.position_ecd[ch] = sin.position_ecd[ch];
+                        g_lift_stall_snapshot.target_ecd[ch] =
+                            g_lift_control_status.axis_target_ecd[ch];
+                        g_lift_stall_snapshot.target_mm[ch] = targets_before[ch];
+                        g_lift_stall_snapshot.output_current[ch] =
+                            g_lift_control_status.output_current[ch];
+                        g_lift_stall_snapshot.applied_current[ch] =
+                            g_lift_control_status.applied_current[ch];
+                        g_lift_stall_snapshot.feedback_current[ch] =
+                            motors.lift.motor[ch].given_current;
+                        g_lift_stall_snapshot.speed_rpm[ch] = input.speed_rpm[ch];
+                    }
+                    g_lift_stall_snapshot.valid = true;
+                    taskEXIT_CRITICAL();
+                }
                 /* Remove the old advancing trajectory immediately, while
                  * retaining the speed PI's support integral/current limit. */
                 lift_top.control.planner_speed_mm_s = 0.0F;
@@ -1988,6 +2256,9 @@ static void lift_control_task(void *argument)
                 g_lift_fault_snapshot.valid = false;
                 g_lift_fault_snapshot.count++;
                 g_lift_fault_snapshot.tick_ms = now;
+                    g_lift_fault_snapshot.feedback_cycle_id = lift_diag_cycle;
+                    g_lift_fault_snapshot.control_evidence_cycle_id =
+                        lift_diag_frame.decision_feedback_cycle_id;
                 g_lift_fault_snapshot.stage_elapsed_ms =
                     (uint32_t)(now - stage_start_before);
                 g_lift_fault_snapshot.stage = (uint8_t)stage_before;
@@ -2084,24 +2355,51 @@ static void lift_control_task(void *argument)
             input.command_fresh = false;
         }
 
+        if (input.homing_request || input.clear_homing_request)
+            g_lift_control_debug.travel_calibration_confirmed = false;
+        if (!g_lift_control_debug.travel_calibration_confirmed)
+        {
+            control_command.enabled = false;
+            if (command.enabled)
+            {
+                lift_reject(LIFT_REJECT_TRAVEL, -1);
+                g_lift_task_command.enabled = false; /* explicit new enable required */
+            }
+        }
+        /* Check the original command, before travel/bench gates disabled it. */
+        if (input.reset_request && command.enabled)
+        {
+            input.reset_request = false;
+            lift_diag_frame.safety.recovery_blocked |= LIFT_RECOVERY_DISABLE;
+            lift_reject(LIFT_REJECT_RECOVERY, -1);
+        }
         lift_top_update(&lift_top, &input, &control_command, &top_status);
+        if (top_status.fault != LIFT_TOP_FAULT_NONE ||
+            top_status.guard_fault != LIFT_GUARD_FAULT_NONE ||
+            g_lift_sequence.state == LIFT_SEQ_STATE_FAULT)
+            lift_owner_inhibit_tests(true);
+        else if (input.reset_request && input.recovery_confirmed && !command.enabled &&
+                 top_status.recovery_blocked == 0U &&
+                 lift_diag_frame.safety.recovery_blocked == 0U)
+            lift_owner_inhibit_tests(false);
+        if (top_status.recovery_blocked) lift_reject(LIFT_REJECT_RECOVERY, -1);
         lift_last_status = top_status;
 
         /*
          * 门禁：算出"该发什么"之后，这里决定"实际发什么"。
-         * 真实下发的四路电流单独记在 applied_current，并把是哪道闸拦下的
+         * 提交意图的四路电流单独记在 applied_current，并把是哪道闸拦下的
          * 记在 output_gate —— 否则 Watch 里"有电流"和"实际没出力"分不清。
          */
         {
             int16_t applied[LIFT_CHANNEL_COUNT] = {0, 0, 0, 0};
             uint8_t gate = (uint8_t)LIFT_OUTPUT_GATE_NONE;
 
-            if (g_dji_can_test_status.running ||
-                g_dji_can_test_status.zero_holding)
+            if (!lift_owner_tests_inhibited() && (g_dji_can_test_status.running ||
+                g_dji_can_test_status.zero_holding))
             {
                 gate = (uint8_t)LIFT_OUTPUT_GATE_CAN_TEST;
             }
-            else if (g_lift_jog_status.running)
+            else if (!lift_owner_tests_inhibited() && g_lift_jog_status.running)
             {
                 gate = (uint8_t)LIFT_OUTPUT_GATE_JOG;
             }
@@ -2112,6 +2410,10 @@ static void lift_control_task(void *argument)
             else if (!all_online)
             {
                 gate = (uint8_t)LIFT_OUTPUT_GATE_OFFLINE;
+            }
+            else if (!g_lift_control_debug.travel_calibration_confirmed && top_status.state != LIFT_TOP_STATE_HOMING)
+            {
+                gate = (uint8_t)LIFT_OUTPUT_GATE_TRAVEL;
             }
             else
             {
@@ -2161,10 +2463,12 @@ static void lift_control_task(void *argument)
             if (gate != (uint8_t)LIFT_OUTPUT_GATE_JOG &&
                 gate != (uint8_t)LIFT_OUTPUT_GATE_CAN_TEST)
             {
+                const uint32_t owner_key = lift_lock_enter();
                 if (lift_owner_claim(LIFT_OWNER_CONTROL, now))
                 {
-                    robot_lift_set_currents(
-                        applied[0], applied[1], applied[2], applied[3]);
+                    robot_lift_set_currents_diagnostic(
+                        applied[0], applied[1], applied[2], applied[3], lift_diag_cycle);
+                    lift_diag_frame.cache_written = true;
                     lift_owner_release(LIFT_OWNER_CONTROL);
                 }
                 else
@@ -2174,12 +2478,18 @@ static void lift_control_task(void *argument)
                      * 这不是故障（占用来得及归还），但要能看见 ——
                      * 否则"算出来有电流、实际没出力"又变成要猜的事。
                      */
+                    lift_diag_frame.owner_conflict = true;
+                    lift_diag_frame.owner_event_ms = osKernelGetTickCount() * portTICK_PERIOD_MS;
                     gate = (uint8_t)LIFT_OUTPUT_GATE_JOG;
                     (void)memset(applied, 0, sizeof(applied));
-                    lift_control_reset(&lift_top.control);
                 }
+                lift_lock_exit(owner_key);
+                /* PID reset is outside the short ownership/cache transaction. */
+                if (lift_diag_frame.owner_conflict) lift_control_reset(&lift_top.control);
             }
 
+            lift_collect_diagnostics(&top_status, &input, &control_command,
+                &command, &motors, applied, gate, now);
             command.target_height_ecd = control_command.target_height_ecd;
             command.target_roll_ecd = control_command.target_roll_ecd;
             command.target_pitch_ecd = control_command.target_pitch_ecd;
@@ -2188,6 +2498,7 @@ static void lift_control_task(void *argument)
                 lift_configuration_applied && all_online &&
                 input.command_fresh);
         }
+        lift_diag_publish(&lift_diag_frame);
         g_lift_control_status.update_count++;
 
         vTaskDelayUntil(
@@ -2202,24 +2513,27 @@ static void lift_control_task(void *argument)
 
 void lift_control_task_init(void)
 {
+    lift_diag_init();
+    lift_diag_cycle = lift_diag_parameter_version = lift_diag_seen_failures = 0U;
+    lift_diag_seen_owner_losses = 0U;
     (void)memset(&g_lift_task_command, 0, sizeof(g_lift_task_command));
     (void)memset(&g_lift_control_status, 0, sizeof(g_lift_control_status));
     (void)memset(&g_lift_seq_status, 0, sizeof(g_lift_seq_status));
     (void)memset(&g_lift_fault_snapshot, 0, sizeof(g_lift_fault_snapshot));
+    (void)memset(&g_lift_stall_snapshot, 0, sizeof(g_lift_stall_snapshot));
 
     lift_set_default_debug();
-    lift_test_start_pending = false;
-    lift_stair_start_pending = false;
     lift_stair_owned = false;
     stair_leg = -1;
     g_lift_control_debug.stair_drive_leg = -1;
+    g_lift_control_debug.test_start_reject_axis = -1;
     g_lift_control_debug.stair_contact_mm = 8;
     g_lift_control_debug.stair_retracted_mm = 2;
     for (uint32_t ch = 0U; ch < 3U; ch++)
         g_lift_control_debug.stair_speed_mm_s[ch] = 50;
     g_lift_control_debug.test_height_mm = 50;
-    g_lift_control_debug.test_auto_zero = true;
-    g_lift_control_debug.test_extend_travel = true;
+    g_lift_control_debug.test_auto_zero = false; /* deprecated; never grants homed */
+    g_lift_control_debug.test_extend_travel = false; /* deprecated; requests are rejected */
     g_lift_control_debug.apply_gains = 0U;
     g_lift_control_debug.set_zero_now = 0U;
     g_lift_control_debug.pid_manual_override = false;
@@ -2293,17 +2607,21 @@ void lift_control_enable(bool enable)
     taskEXIT_CRITICAL();
 }
 
-void lift_control_set_target(
-    int32_t height_ecd,
-    int32_t roll_ecd,
-    int32_t pitch_ecd)
+void lift_control_set_target_from(lift_diag_source_t source,
+    int32_t height_ecd, int32_t roll_ecd, int32_t pitch_ecd)
 {
     taskENTER_CRITICAL();
+    g_lift_task_command.diagnostic_source = (uint8_t)source;
     g_lift_task_command.target_height_ecd = height_ecd;
     g_lift_task_command.target_roll_ecd = roll_ecd;
     g_lift_task_command.target_pitch_ecd = pitch_ecd;
     g_lift_task_command.command_update_tick = osKernelGetTickCount();
     taskEXIT_CRITICAL();
+}
+
+void lift_control_set_target(int32_t height, int32_t roll, int32_t pitch)
+{
+    lift_control_set_target_from(LIFT_DIAG_SOURCE_API, height, roll, pitch);
 }
 
 void lift_control_request_homing(void)

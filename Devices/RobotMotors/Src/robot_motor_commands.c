@@ -1,6 +1,8 @@
 #include "robot_motor_commands.h"
 
 #include "can_tx_service.h"
+#include "lift_diagnostics.h"
+#include "lift_safety.h"
 #include "cmsis_os2.h"
 #include "dji_motor.h"
 #include "FreeRTOS.h"
@@ -17,6 +19,9 @@
 #define DJI_CAN_TEST_MAX_DURATION_MS     5000U
 
 static robot_motor_commands_t command_cache;
+/* Only the unique TX task accesses this source snapshot. */
+static lift_motor_commands_t lift_tx_snapshot;
+static bool lift_tx_override, lift_tx_timeout;
 static osThreadId_t motor_tx_task_handle;
 static StaticTask_t motor_tx_task_control;
 static StackType_t motor_tx_task_stack[ROBOT_MOTOR_TX_TASK_STACK_WORDS];
@@ -64,10 +69,34 @@ static can_tx_service_status_t send_dji_group(
     int16_t motor4)
 {
     uint8_t data[8];
+    /* Never replay a bench cache/override through a latched main-chain fault.
+     * A CONTROL fault-stop command remains subject to its existing executor. */
+    if (bus == CAN_BUS_1 && std_id == ROBOT_DJI_COMMAND_ID_1_TO_4 &&
+        lift_owner_tests_inhibited() &&
+        (lift_tx_override || lift_tx_snapshot.diagnostic_cycle_id == 0U))
+        motor1 = motor2 = motor3 = motor4 = 0;
 
     dji_motor_pack_group_command(
         data, motor1, motor2, motor3, motor4);
-    return can_tx_service_send(bus, std_id, data, 8U);
+    {
+        const can_tx_service_status_t result = can_tx_service_send(bus, std_id, data, 8U);
+        if (bus == CAN_BUS_1 && std_id == ROBOT_DJI_COMMAND_ID_1_TO_4)
+        {
+            int16_t packed[4];
+            uint32_t ch;
+            const uint32_t tick = osKernelGetTickCount();
+            for (ch = 0U; ch < 4U; ++ch)
+                packed[ch] = (int16_t)(((uint16_t)data[ch * 2U] << 8) |
+                                       data[ch * 2U + 1U]);
+            taskENTER_CRITICAL();
+            lift_diag_tx(packed, lift_tx_snapshot.diagnostic_generation,
+                lift_tx_override ? 0U : lift_tx_snapshot.diagnostic_cycle_id, tick * portTICK_PERIOD_MS,
+                (uint8_t)result, lift_tx_timeout,
+                lift_tx_override);
+            taskEXIT_CRITICAL();
+        }
+        return result;
+    }
 }
 
 /** 根据被测反馈 ID 反推出组命令 ID 和帧内电机槽位。 */
@@ -145,6 +174,7 @@ static bool dji_can_test_prepare(
     int16_t currents[4])
 {
     static bool active = false;
+    static bool owns_lift = false;
     static bool zero_hold_active = false;
     static uint32_t zero_hold_start_tick;
     static uint32_t start_tick;
@@ -169,6 +199,8 @@ static bool dji_can_test_prepare(
             return false;
         }
 
+        if (owns_lift && (selected_bus != CAN_BUS_1 || selected_command_id != ROBOT_DJI_COMMAND_ID_1_TO_4))
+        { lift_owner_release(LIFT_OWNER_CAN_TEST); owns_lift = false; }
         selected_current = clamp_current(
             g_dji_can_test_command.test_current,
             DJI_CAN_TEST_CURRENT_LIMIT);
@@ -215,9 +247,27 @@ static bool dji_can_test_prepare(
 
     if (!active && !zero_hold_active)
     {
+        if (owns_lift) { lift_owner_release(LIFT_OWNER_CAN_TEST); owns_lift = false; }
         return false;
     }
 
+    if (selected_bus == CAN_BUS_1 && selected_command_id == ROBOT_DJI_COMMAND_ID_1_TO_4)
+    {
+        if (lift_owner_tests_inhibited())
+        {
+            active = zero_hold_active = false;
+            g_dji_can_test_command.enabled = false;
+            g_dji_can_test_status.running = false;
+            g_dji_can_test_status.zero_holding = false;
+            g_dji_can_test_status.applied_current = 0;
+            lift_owner_release(LIFT_OWNER_CAN_TEST);
+            owns_lift = false;
+            return false;
+        }
+        owns_lift = lift_owner_claim_override(LIFT_OWNER_CAN_TEST,
+            current_tick * portTICK_PERIOD_MS, NULL);
+        if (!owns_lift) return false;
+    }
     currents[0] = 0;
     currents[1] = 0;
     currents[2] = 0;
@@ -284,6 +334,8 @@ static void robot_motor_tx_task(void *argument)
     {
         robot_motor_commands_get_snapshot(&commands);
         current_tick = osKernelGetTickCount();
+        lift_tx_snapshot = commands.lift;
+        lift_tx_timeout = !command_is_fresh(current_tick, commands.lift.update_tick);
 
         /* 各子系统独立超时归零，某一控制任务卡死不会保留最后一次电流。 */
         if (!command_is_fresh(current_tick, commands.chassis.update_tick))
@@ -342,6 +394,8 @@ static void robot_motor_tx_task(void *argument)
             test_command_id,
             test_currents);
 
+        lift_tx_override = test_ready && test_bus == CAN_BUS_1 &&
+            test_command_id == ROBOT_DJI_COMMAND_ID_1_TO_4;
         send_dji_group_with_test_override(
             CAN_BUS_1,
             ROBOT_DJI_COMMAND_ID_1_TO_4,
@@ -451,11 +505,9 @@ void robot_chassis_set_currents(
 }
 
 /** 限幅并原子更新四个抬升电机电流及其时间戳。 */
-void robot_lift_set_currents(
-    int16_t motor1,
-    int16_t motor2,
-    int16_t motor3,
-    int16_t motor4)
+static void robot_lift_cache_currents(
+    int16_t motor1, int16_t motor2, int16_t motor3, int16_t motor4,
+    uint32_t cycle_id, uint8_t source)
 {
     const int16_t currents[ROBOT_LIFT_MOTOR_COUNT] = {
         motor1, motor2, motor3, motor4};
@@ -469,7 +521,22 @@ void robot_lift_set_currents(
             clamp_current(currents[index], ROBOT_3508_CURRENT_LIMIT);
     }
     command_cache.lift.update_tick = tick;
+    command_cache.lift.diagnostic_cycle_id = cycle_id;
+    ++command_cache.lift.diagnostic_generation;
+    lift_diag_cache(command_cache.lift.motor, cycle_id,
+                    tick * portTICK_PERIOD_MS, source);
     taskEXIT_CRITICAL();
+}
+
+void robot_lift_set_currents(int16_t m0, int16_t m1, int16_t m2, int16_t m3)
+{
+    robot_lift_cache_currents(m0, m1, m2, m3, 0U,
+        lift_owner_current() == LIFT_OWNER_JOG ? LIFT_DIAG_SOURCE_JOG : LIFT_DIAG_SOURCE_OTHER);
+}
+void robot_lift_set_currents_diagnostic(int16_t m0, int16_t m1,
+    int16_t m2, int16_t m3, uint32_t cycle_id)
+{
+    robot_lift_cache_currents(m0, m1, m2, m3, cycle_id, LIFT_DIAG_SOURCE_CONTROL);
 }
 
 /** 限幅并原子更新 Yaw 电机电流及其时间戳。 */

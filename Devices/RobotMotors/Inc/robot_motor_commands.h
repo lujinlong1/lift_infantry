@@ -16,6 +16,7 @@ typedef struct
 {
     int16_t motor[ROBOT_LIFT_MOTOR_COUNT];
     uint32_t update_tick;
+    uint32_t diagnostic_cycle_id, diagnostic_generation;
 } lift_motor_commands_t;
 
 typedef struct
@@ -81,6 +82,10 @@ void robot_lift_set_currents(
     int16_t motor2,
     int16_t motor3,
     int16_t motor4);
+
+/* Same clamp/cache behavior as the legacy setter, with control provenance. */
+void robot_lift_set_currents_diagnostic(int16_t m0, int16_t m1,
+    int16_t m2, int16_t m3, uint32_t cycle_id);
 
 void robot_gimbal_set_yaw_current(int16_t current);
 

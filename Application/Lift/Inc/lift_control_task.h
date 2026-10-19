@@ -2,6 +2,7 @@
 #define LIFT_CONTROL_TASK_H
 
 #include "lift_seq.h"
+#include "lift_diagnostics.h"
 #include "lift_top.h"
 
 #include <stdbool.h>
@@ -36,11 +37,12 @@
  * 调用方不需要（也不应该）自己清。
  *
  * 注意 enabled 的语义：它必须被【周期刷新】。设备层对抬升组也有
- * "命令超时归零"（100 ms），但那是兜底；抬升的正确超时行为是
- * lift_guard 的**受控缓降**（ADR-006），不是断力——本机构不自锁。
+ * "命令超时归零"（100 ms）。既有 lift_guard 超时支路请求下降电流，
+ * 其下降速度、承载和防坠能力尚未验证，不能替代机械支撑。
  */
 typedef struct
 {
+    volatile uint8_t diagnostic_source; /* Watch default; API/remote tag */
     volatile bool enabled;
     volatile int32_t target_height_ecd;
     volatile int32_t target_roll_ecd;
@@ -75,9 +77,9 @@ typedef struct
      */
     volatile uint8_t apply_gains;
     /*
-     * 软零点：把四轴当前位置当作零点、直接进入 READY。
-     * 台架调 PID 时跳过真实找零用。⚠️ 无机械基准，限位/堵转判定意义打折，
-     * 只能架空调试用；正式跑之前必须重新真实找零。
+     * 软件零点仅记录当前位置，保持 IDLE / !homed，不能替代机械找零。
+     * 仅在主命令禁用、四轴在线静止、无故障且尚未 homed 时接受。
+     * 不清故障，也不授予运动资格。
      */
     volatile uint8_t set_zero_now;
     /*
@@ -193,11 +195,12 @@ typedef struct
     volatile bool sequence_reset;
     /* One-shot lift-only test. Default height is 50 mm;
      * test_height_mm is adjustable in Watch (9..200 mm). Sets height/8/2 mm,
-     * confirmed front/rear layout, and clears stale advance requests.
-     * Only the startup "already outside soft limits" fault is auto-reset.
+     * requires explicitly confirmed layout and measured travel, and clears
+     * stale advance requests. Fault reset is always a separate operator action.
      * Result: 0 idle, 1 accepted, 2 not homed, 3 busy, 4 fault,
      * 5 bench owns motors, 6 invalid test height, 7 datum moving/offline,
-     * 8 invalid stair configuration, 9 chassis moving/offline.
+     * 8 invalid stair configuration, 9 chassis moving/offline,
+     * 10 layout unconfirmed, 11 travel unconfirmed/outside applied envelope.
      * Normal sequence prechecks and controller travel margins still apply.
      * Reaches TEST_HOLD (16), not chassis APPROACH_STEP. */
     volatile bool test_start;
@@ -206,27 +209,39 @@ typedef struct
     volatile bool test_pause;  /* pulse: freeze measured pose, keep powered */
     volatile bool test_resume; /* pulse: resume lift or descent */
     volatile bool test_lower;  /* pulse: descend; all axes near 2 mm -> latched zero current */
-    volatile bool test_auto_zero; /* Default true: use stationary start pose if unhomed. */
-    volatile bool test_extend_travel; /* provisional 200mm displacement compensation */
+    volatile bool travel_calibration_confirmed; /* operator confirms measured per-axis limits/reference */
+    volatile bool fault_recovery_confirmed; /* pulse: mechanical support installed, reset is intentional */
+    volatile bool test_auto_zero; /* compatibility flag, ignored; never grants physical homing */
+    volatile bool test_extend_travel; /* obsolete extension request: true rejects test startup */
     volatile bool stair_start; /* full stair flow; result uses test_start_result */
-    volatile int32_t stair_distance_mm[3]; /* default 0: must measure before starting */
+    volatile int32_t stair_distance_mm[3]; /* 0: pause for input; 1..2000: total leg distance */
     volatile int32_t stair_speed_mm_s[3]; /* 10..200 mm/s */
     volatile int32_t stair_contact_mm;
     volatile int32_t stair_retracted_mm;
     volatile bool stair_drive_release; /* only idle/complete; restore remote ownership */
     volatile int32_t stair_drive_progress_mm;
+    volatile int32_t stair_drive_target_mm; /* accepted total distance for the current leg */
+    volatile uint8_t stair_drive_input_result; /* 0 none, 1 accepted, 2 waiting/invalid, 3 moving */
+    volatile bool stair_drive_waiting_input; /* enter distance, then pulse test_resume */
     volatile int8_t stair_drive_leg; /* -1 not advancing, 0..2 */
     volatile uint8_t stair_drive_stop_reason; /* 0 normal, 1 offline, 2 no progress, 3 backwards */
     volatile uint8_t stair_retracted_mask; /* latched zero-current axes during stair run */
+    /* Evidence from the most recently processed startup request, not live
+     * feedback. Retry explicitly after fixing the cause; no automatic retry. */
+    volatile uint8_t test_start_reject_group; /* 0 none, 1 lift/CAN1, 2 chassis/CAN2 */
+    volatile int8_t test_start_reject_axis; /* 0..3, -1 no motor rejection */
+    volatile uint8_t test_start_reject_reason; /* 1 no feedback, 2 >100ms old, 3 moving */
+    volatile int16_t test_start_reject_rpm;
+    volatile uint32_t test_start_reject_age_ms; /* UINT32_MAX: never received */
 } lift_control_debug_t;
 
 /* 平铺的 volatile 状态，专供 Keil Watch 与调试记录使用。 */
 
 /*
- * 本周期是谁把真实下发压成 0 的。顺序即优先级（与 lift_control_task.c 一致）。
+ * 本周期的提交门禁。实际优先级：CAN 测试、JOG、参数、离线。
  *
  * 为什么需要它：output_current 是"模块链算出来的电流"，
- * applied_current 才是"真的进了 CAN1 0x200 的电流"。两者不一致时，
+ * applied_current 是任务提交意图；实际缓存/打包/返回结果看 g_lift_diag。两者不一致时，
  * 没有这个字段就只能靠猜——而"显示有电流、实际没出力"在调试期最容易误导人。
  */
 typedef enum
@@ -235,11 +250,15 @@ typedef enum
     LIFT_OUTPUT_GATE_NO_CONFIG,  /* 标定参数没生效 */
     LIFT_OUTPUT_GATE_OFFLINE,    /* 有抬升轴掉线（四轴必须全在线） */
     LIFT_OUTPUT_GATE_JOG,        /* 诊断点动模块在占用 */
-    LIFT_OUTPUT_GATE_CAN_TEST    /* CAN 点动测试在占用 */
+    LIFT_OUTPUT_GATE_CAN_TEST,   /* CAN test owns output */
+    LIFT_OUTPUT_GATE_TRAVEL      /* measured calibration not confirmed */
 } lift_output_gate_t;
 
 typedef struct
 {
+    volatile uint8_t request_reject;
+    volatile int8_t request_reject_axis;
+    volatile uint32_t request_reject_cycle_id;
     volatile bool running;
     volatile bool configuration_applied;
     volatile bool homed;
@@ -248,7 +267,7 @@ typedef struct
     volatile bool output_gated;           /* 本周期真实下发被门禁压成 0 */
     /*
      * output_gate 取值（见 lift_output_gate_t）：
-     *   0 无门禁 / 1 参数未生效 / 2 抬升轴掉线 / 3 诊断点动占用 / 4 CAN 点动测试占用
+     *   0 无门禁 / 1 参数未生效 / 2 抬升轴掉线 / 3 诊断点动占用 / 4 CAN 点动测试占用 / 5 行程标定未确认
      * 有它才能一眼分清"控制器算出来是 0"和"算出来有值但被闸掉了"。
      */
     volatile uint8_t output_gate;
@@ -262,15 +281,9 @@ typedef struct
     volatile bool command_fresh;
     volatile bool configuration_rejected;
     volatile bool limit_blocked[4];
-    /*
-     * 故障停机动作的真实状态（见 lift_safety.h）：
-     *   stop_action   0 = HOLD / 1 = LOWER / 2 = CUT
-     *   stop_active   动作还没做完
-     *   stop_capable  **保持电流已标定**，HOLD/LOWER 不会退化成断电
-     *
-     * ⚠️ stop_capable == 0 意味着：现在任何故障都会导致四轴断电。
-     *    本机构不自锁，那就是掉车。**这是能力缺口，不是可以忽略的提示。**
-     */
+    /* Fault executor electrical action: 0 HOLD / 1 LOWER / 2 CUT.
+     * active means current requested; capable remains false (physical unverified).
+     * See g_lift_diag.frame.safety for configured output vs physical capability. */
     volatile uint8_t stop_action;
     volatile bool stop_active;
     volatile bool stop_capable;
@@ -303,7 +316,7 @@ typedef struct
      * applied_current[]，两者只有在 output_gated = 0 时才相同。
      */
     volatile int16_t output_current[4];
-    /* 真实交给设备层、最终进 CAN1 0x200 的电流，带符号。 */
+    /* 原始方向的提交意图；占用时未写缓存。不是 CAN 发送或电机确认。 */
     volatile int16_t applied_current[4];
     volatile int32_t actual_height;
     volatile int32_t actual_roll;
@@ -420,6 +433,8 @@ typedef struct
     volatile bool valid;
     volatile uint32_t count;
     volatile uint32_t tick_ms;
+    volatile uint32_t feedback_cycle_id;
+    volatile uint32_t control_evidence_cycle_id; /* preceding cycle */
     volatile uint32_t stage_elapsed_ms;
     volatile uint8_t stage;
     volatile const char *stage_name;
@@ -441,12 +456,36 @@ typedef struct
     volatile bool online[4];
 } lift_fault_snapshot_t;
 
+/* Latched before a stalled motion is replaced by the powered pause target.
+ * Command currents are from the preceding cycle, feedback from the trigger
+ * cycle. Currents and RPM use raw motor direction; positions use lift direction. */
+typedef struct
+{
+    volatile bool valid;
+    volatile uint32_t count;
+    volatile uint32_t tick_ms;
+    volatile uint32_t feedback_cycle_id;
+    volatile uint32_t control_evidence_cycle_id; /* preceding cycle */
+    volatile uint8_t stage;
+    volatile int32_t axis;
+    volatile bool stair_run;
+    volatile uint8_t output_gate;
+    volatile int32_t position_ecd[4];
+    volatile int32_t target_ecd[4];
+    volatile int32_t target_mm[4];
+    volatile int16_t output_current[4];
+    volatile int16_t applied_current[4];
+    volatile int16_t feedback_current[4];
+    volatile int16_t speed_rpm[4];
+} lift_stall_snapshot_t;
+
 extern lift_task_command_t g_lift_task_command;
 extern lift_control_debug_t g_lift_control_debug;
 extern lift_task_status_t g_lift_control_status;
 extern lift_seq_t g_lift_sequence;
 extern lift_seq_pub_t g_lift_seq_status;
 extern lift_fault_snapshot_t g_lift_fault_snapshot;
+extern lift_stall_snapshot_t g_lift_stall_snapshot;
 
 /* 初始化命令面与标定参数的默认值（不产生任何电流）。 */
 void lift_control_task_init(void);
@@ -461,6 +500,8 @@ void lift_control_set_target(
     int32_t height_ecd,
     int32_t roll_ecd,
     int32_t pitch_ecd);
+void lift_control_set_target_from(lift_diag_source_t source,
+    int32_t height_ecd, int32_t roll_ecd, int32_t pitch_ecd);
 void lift_control_request_homing(void);
 void lift_control_request_clear_homing(void);
 void lift_control_request_reset(void);

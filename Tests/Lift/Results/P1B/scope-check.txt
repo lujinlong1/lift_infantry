@@ -1,0 +1,27 @@
+Baseline: D:\rm\lift_infantry\_staging\p1b_baseline_20261019
+PASS: 19 executable suites + 7 strict firmware compile checks
+PASS: Arm Compiler 6.21 full rebuild, zero errors/warnings
+PASS: unchanged PID/feedforward/planner/limits/Guard/homing/sync/kinematics/geometry sources
+PASS: legacy stop request policy and sequence default configuration token-equivalent
+PASS: control period, current/travel/timeout constants and lift stack unchanged
+PASS: scatter/project/FreeRTOS/UART/telemetry/P1A diagnostics implementation/P0 and P1A reports unchanged
+PASS: git diff whitespace and baseline per-file EOL checks
+Modified pre-existing files versus P1A workspace baseline (18):
+Application/Lift/Inc/lift_control_task.h
+Application/Lift/Inc/lift_diagnostics.h
+Application/Lift/Inc/lift_safety.h
+Application/Lift/Inc/lift_seq.h
+Application/Lift/Inc/lift_top.h
+Application/Lift/Src/lift_control_task.c
+Application/Lift/Src/lift_safety.c
+Application/Lift/Src/lift_seq.c
+Application/Lift/Src/lift_top.c
+Devices/RobotMotors/Src/robot_motor_commands.c
+Diagnostics/MotorTest/Inc/lift_jog_task.h
+Diagnostics/MotorTest/Src/lift_jog_task.c
+Tests/Lift/test_lift_axes.c
+Tests/Lift/test_lift_jog.c
+Tests/Lift/test_lift_safety.c
+Tests/Lift/test_lift_seq.c
+Tests/Lift/test_lift_top.c
+Tests/Lift/test_lift_transport.c

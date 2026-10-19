@@ -396,6 +396,7 @@ typedef struct
     volatile bool     own_lost;
     /* 累计"没抢到通道"的次数。一直在涨 = 有人在持续占着通道 */
     volatile uint32_t own_lost_count;
+    volatile uint32_t own_lost_tick_ms; /* diagnostic event time, not a control cycle */
     /* 累计"从主链手里接管通道"的次数。正常应该只涨几次（每次使能一两次） */
     volatile uint32_t own_preempt_count;
     /* 通道现在在谁手里（lift_owner_t：0=NONE 1=CONTROL 2=JOG 3=CAN_TEST） */
@@ -415,7 +416,8 @@ typedef enum
     LIFT_TEST_END_OFFLINE = 5,
     LIFT_TEST_END_MODE_CHANGED = 6,
     LIFT_TEST_END_MODE_OFF = 7,
-    LIFT_TEST_END_STALL = 8
+    LIFT_TEST_END_STALL = 8,
+    LIFT_TEST_END_FAULT_INHIBIT = 9
 } lift_test_end_reason_t;
 
 /*

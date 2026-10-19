@@ -29,6 +29,7 @@ $stubs   = Join-Path $dir 'fwstubs'
 # without a full RTOS/HAL). Everything else is compiled by the unit suites
 # already, but compiling it here too keeps this check self-contained.
 $targets = @(
+    @{ name = 'lift_diagnostics.c'; src = (Join-Path $liftSrc 'lift_diagnostics.c') },
     @{ name = 'chassis_control.c'; src = (Join-Path $fwRoot 'Application\Chassis\Src\chassis_control.c') },
     @{ name = 'lift_control_task.c'; src = (Join-Path $liftSrc 'lift_control_task.c') },
     @{ name = 'lift_top.c';          src = (Join-Path $liftSrc 'lift_top.c') },

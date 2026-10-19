@@ -460,6 +460,9 @@ int main(void)
 
     fill_input(&in, &plant, t + (2U * STEP_MS));
     in.reset_request = true;
+    in.recovery_confirmed = true;
+    cmd.enabled = false;
+    for (ch = 0U; ch < N; ch++) in.speed_rpm[ch] = 0;
     lift_top_update(&top, &in, &cmd, &st);
     CHECK(st.state == LIFT_TOP_STATE_IDLE, "复位后回到 IDLE（尚未找零）");
     CHECK(st.fault == LIFT_TOP_FAULT_NONE, "故障码清零");

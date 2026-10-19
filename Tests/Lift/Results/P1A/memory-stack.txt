@@ -1,0 +1,36 @@
+DMA buffers:
+  dbus_dma_buffer: 0x200006E8, 36 bytes, SRAM DMA-accessible
+  telemetry_frame: 0x2001040C, 116 bytes, SRAM DMA-accessible
+RW_IRAM2: used 52440, free 13096, maximum 65536
+RW_IRAM1: used 117984, free 13088, maximum 131072
+Task, allocated bytes, Keil max depth, reserve, residual:
+  can_rx_task, 2048, 136, 512, 1400
+  robot_motor_tx_task, 2048, 200, 512, 1336
+  lift_test_task, 3072, 664, 512, 1896
+  chassis_control_task, 2048, 616, 512, 920
+  friction_task, 2048, 600, 512, 936
+  feed_task, 2048, 600, 512, 936
+  shooter_task, 2048, 608, 512, 928
+  yaw_task, 2048, 616, 512, 920
+  pitch_task, 2048, 616, 512, 920
+  lift_control_task, 8192, 4256, 1024, 2912
+  remote_task, 2048, 128, 512, 1408
+  telemetry_task, 2048, 128, 512, 1408
+  link_task, 1024, 500, 512, 12
+  REVIEW: link_task has <256B residual after reserve; runtime high-water test required
+  runtime_monitor_task, 1536, 128, 512, 896
+  StartSystemTask, 2048, 1352, 512, 184
+  REVIEW: StartSystemTask has <256B residual after reserve; runtime high-water test required
+  prvIdleTask, 512, 72, 256, 184
+  REVIEW: prvIdleTask has <256B residual after reserve; runtime high-water test required
+  prvTimerTask, 1024, 136, 512, 376
+g_lift_blackbox: 0x200008B0, 58264 bytes
+g_lift_diag: 0x2000EE54, 608 bytes
+g_lift_diag_transport: 0x200002C4, 92 bytes
+lift_diag_frame: 0x10004D30, 560 bytes
+snapshot: 0x2000FE78, 560 bytes
+ucHeap: 0x200105B0, 49152 bytes
+Stack_Mem: 0x1000C8D8, 1024 bytes
+Heap_Mem: 0x2001CAE0, 512 bytes
+PASS: actual SRAM/CCM/DMA placement and task static stack reserves
+LIMIT: static call graph excludes runtime scheduling, ISR nesting and unresolved callbacks; no WCET claim

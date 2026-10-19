@@ -1,0 +1,17 @@
+PASS: 19 executable suites and 7 strict compile checks
+PASS: Arm Compiler 6.21 full rebuild; zero errors/warnings
+PASS: forbidden control algorithms, guard/homing/top/sequence, scatter, FreeRTOS config, USART and P0 report unchanged from pre-P1A baseline
+PASS: stop policy byte-equivalent to baseline; JOG no longer releases CONTROL
+PASS: whitespace/EOL checks
+Modified pre-existing files versus P0 workspace baseline:
+Application/Lift/Inc/lift_diagnostics.h
+Application/Lift/Inc/lift_safety.h
+Application/Lift/Src/lift_control_task.c
+Application/Lift/Src/lift_diagnostics.c
+Application/Lift/Src/lift_safety.c
+Devices/RobotMotors/Src/robot_motor_commands.c
+Diagnostics/MotorTest/Src/lift_jog_task.c
+Diagnostics/Telemetry/Src/telemetry_task.c
+Tests/Lift/run_tests.ps1
+Tests/Lift/test_lift_jog.c
+Tests/Lift/test_lift_transport.c

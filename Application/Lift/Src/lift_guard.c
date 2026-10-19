@@ -52,10 +52,11 @@ static void guard_clear_stall(lift_guard_t *self)
 }
 
 /** 进入故障态：锁存故障码并停止全部输出。 */
-static void guard_set_fault(lift_guard_t *self, lift_guard_fault_t fault)
+static void guard_set_fault(lift_guard_t *self, lift_guard_fault_t fault, int8_t axis)
 {
     self->state = LIFT_GUARD_STATE_FAULT;
     self->fault = fault;
+    self->fault_axis = axis;
     guard_clear_stall(self);
 }
 
@@ -132,6 +133,7 @@ void lift_guard_init(lift_guard_t *self, const lift_guard_config_t *config)
 
     self->state = LIFT_GUARD_STATE_DISARMED;
     self->fault = LIFT_GUARD_FAULT_NONE;
+    self->fault_axis = -1;
 }
 
 void lift_guard_update(
@@ -161,6 +163,7 @@ void lift_guard_update(
     if (reset_rising)
     {
         self->fault = LIFT_GUARD_FAULT_NONE;
+        self->fault_axis = -1;
         self->state = in->homed
             ? LIFT_GUARD_STATE_READY
             : LIFT_GUARD_STATE_DISARMED;
@@ -179,7 +182,7 @@ void lift_guard_update(
     {
         if (!in->online[ch])
         {
-            guard_set_fault(self, LIFT_GUARD_FAULT_OFFLINE);
+            guard_set_fault(self, LIFT_GUARD_FAULT_OFFLINE, (int8_t)ch);
             goto emit;
         }
     }
@@ -243,7 +246,7 @@ void lift_guard_update(
                 else if ((uint32_t)(in->now_ms - self->stall_start_ms[ch]) >=
                          self->config.descent_stall_ms)
                 {
-                    guard_set_fault(self, LIFT_GUARD_FAULT_DESCENT_STALL);
+                    guard_set_fault(self, LIFT_GUARD_FAULT_DESCENT_STALL, (int8_t)ch);
                     goto emit;
                 }
                 else
@@ -275,7 +278,7 @@ void lift_guard_update(
 
             if (out->descent_elapsed_ms >= self->config.descent_timeout_ms)
             {
-                guard_set_fault(self, LIFT_GUARD_FAULT_DESCENT_TIMEOUT);
+                guard_set_fault(self, LIFT_GUARD_FAULT_DESCENT_TIMEOUT, -1);
                 goto emit;
             }
         }
@@ -339,6 +342,7 @@ void lift_guard_update(
 emit:
     out->state = self->state;
     out->fault = self->fault;
+    out->fault_axis = self->fault_axis;
 
     if (self->state == LIFT_GUARD_STATE_FAULT)
     {

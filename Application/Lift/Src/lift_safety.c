@@ -1,101 +1,126 @@
 #include "lift_safety.h"
-
+#include "lift_lock.h"
 #include <stddef.h>
+#if !defined(__arm__) && !defined(__thumb__)
+#include <stdatomic.h>
+static atomic_flag owner_lock = ATOMIC_FLAG_INIT;
+static _Thread_local uint32_t owner_lock_depth;
+uint32_t lift_lock_enter(void)
+{
+    uint32_t key = owner_lock_depth++;
+    if (key == 0U)
+        while (atomic_flag_test_and_set_explicit(&owner_lock, memory_order_acquire)) { }
+    return key;
+}
+void lift_lock_exit(uint32_t key)
+{
+    owner_lock_depth = key;
+    if (key == 0U) atomic_flag_clear_explicit(&owner_lock, memory_order_release);
+}
+#endif
 
-/* ==================================================================== */
-/*  命令通道所有权                                                      */
-/* ==================================================================== */
-
-/*
- * 当前所有者与认领时刻。读写都在临界区外也不要紧的前提是：
- *   - 只有 32 位对齐量的单次读写，Cortex-M4 上是原子的；
- *   - 竞争窗口最坏导致"两边都以为自己有所有权"持续一个周期，
- *     而看门狗（默认 50 ms）会在下一周期把不刷新的那一方踢掉。
- * 真正要防的是【长期】双写，那个由刷新机制保证。
- */
-static volatile lift_owner_t owner_state = LIFT_OWNER_NONE;
-static volatile uint32_t owner_tick_ms = 0U;
-static volatile uint32_t owner_timeout_ms = 50U;
-
+/* All state and lease timestamps use the same lock. Task APIs, not mutexes;
+ * the lock also protects the final claim/check + cache write at call sites. */
+static lift_owner_t owner_state = LIFT_OWNER_NONE;
+static uint32_t owner_tick_ms;
+static bool tests_inhibited;
+static uint32_t owner_timeout_ms = 50U;
+static bool owner_valid(lift_owner_t owner)
+{
+    return owner >= LIFT_OWNER_CONTROL && owner <= LIFT_OWNER_CAN_TEST;
+}
 bool lift_owner_claim(lift_owner_t owner, uint32_t now_ms)
 {
-    if (owner == LIFT_OWNER_NONE)
-    {
-        return false;
-    }
-
-    if ((owner_state == LIFT_OWNER_NONE) || (owner_state == owner))
-    {
-        owner_state = owner;
-        owner_tick_ms = now_ms;
-        return true;
-    }
-
-    return false;
+    uint32_t key = lift_lock_enter();
+    bool accepted = owner_valid(owner) && (!tests_inhibited || owner == LIFT_OWNER_CONTROL) &&
+        (owner_state == LIFT_OWNER_NONE || owner_state == owner);
+    if (accepted) { owner_state = owner; owner_tick_ms = now_ms; }
+    lift_lock_exit(key);
+    return accepted;
 }
-
+bool lift_owner_claim_override(lift_owner_t owner, uint32_t now_ms,
+                                lift_owner_t *previous)
+{
+    uint32_t key = lift_lock_enter();
+    bool accepted = !tests_inhibited && (owner == LIFT_OWNER_JOG || owner == LIFT_OWNER_CAN_TEST) &&
+        (owner_state == LIFT_OWNER_NONE || owner_state == owner ||
+         owner_state == LIFT_OWNER_CONTROL ||
+         (owner == LIFT_OWNER_CAN_TEST && owner_state == LIFT_OWNER_JOG));
+    if (previous != NULL) *previous = owner_state;
+    if (accepted) { owner_state = owner; owner_tick_ms = now_ms; }
+    lift_lock_exit(key);
+    return accepted;
+}
 void lift_owner_release(lift_owner_t owner)
 {
-    if ((owner != LIFT_OWNER_NONE) && (owner_state == owner))
-    {
-        owner_state = LIFT_OWNER_NONE;
-    }
+    uint32_t key = lift_lock_enter();
+    if (owner_valid(owner) && owner_state == owner) owner_state = LIFT_OWNER_NONE;
+    lift_lock_exit(key);
 }
-
 lift_owner_t lift_owner_current(void)
 {
-    return owner_state;
+    uint32_t key = lift_lock_enter();
+    lift_owner_t result = owner_state;
+    lift_lock_exit(key);
+    return result;
 }
-
 bool lift_owner_may_write(lift_owner_t want)
 {
-    const lift_owner_t current = owner_state;
-
-    if (want == LIFT_OWNER_NONE)
-    {
-        return false;
-    }
-    return (current == LIFT_OWNER_NONE) || (current == want);
+    uint32_t key = lift_lock_enter();
+    bool result = owner_valid(want) && (!tests_inhibited || want == LIFT_OWNER_CONTROL) &&
+        (owner_state == LIFT_OWNER_NONE || owner_state == want);
+    lift_lock_exit(key);
+    return result; /* advisory only: never use as check-then-write authorization */
 }
-
 void lift_owner_set_timeout_ms(uint32_t timeout_ms)
 {
+    uint32_t key = lift_lock_enter();
     owner_timeout_ms = timeout_ms;
+    lift_lock_exit(key);
 }
-
 uint32_t lift_owner_timeout_ms(void)
 {
-    return owner_timeout_ms;
+    uint32_t key = lift_lock_enter();
+    uint32_t result = owner_timeout_ms;
+    lift_lock_exit(key);
+    return result;
 }
-
 void lift_owner_tick(uint32_t now_ms)
 {
-    const uint32_t timeout = owner_timeout_ms;
-
-    if ((owner_state == LIFT_OWNER_NONE) || (timeout == 0U))
-    {
-        return;
-    }
-    if ((uint32_t)(now_ms - owner_tick_ms) > timeout)
-    {
-        /*
-         * 认领方超过 timeout 没刷新：它要么死了，要么忘了释放。
-         * 自动失效，把通道让出来——否则抬升会永久没有写入者。
-         */
+    uint32_t key = lift_lock_enter();
+    uint32_t age = now_ms - owner_tick_ms;
+    /* A caller sampled now before being preempted by a newer lease refresh.
+     * Do not interpret that stale timestamp as an almost-2^32-ms timeout. */
+    if (owner_state != LIFT_OWNER_NONE && owner_timeout_ms != 0U &&
+        age < 0x80000000UL && age > owner_timeout_ms)
         owner_state = LIFT_OWNER_NONE;
-    }
+    lift_lock_exit(key);
 }
-
+void lift_owner_inhibit_tests(bool inhibited)
+{
+    const uint32_t key = lift_lock_enter();
+    tests_inhibited = inhibited;
+    if (inhibited && (owner_state == LIFT_OWNER_JOG || owner_state == LIFT_OWNER_CAN_TEST))
+        owner_state = LIFT_OWNER_NONE;
+    lift_lock_exit(key);
+}
+bool lift_owner_tests_inhibited(void)
+{
+    const uint32_t key = lift_lock_enter();
+    const bool result = tests_inhibited;
+    lift_lock_exit(key);
+    return result;
+}
 void lift_owner_reset(void)
 {
+    uint32_t key = lift_lock_enter();
     owner_state = LIFT_OWNER_NONE;
     owner_tick_ms = 0U;
+    tests_inhibited = false;
+    lift_lock_exit(key);
 }
 
-/* ==================================================================== */
-/*  故障停机策略                                                        */
-/* ==================================================================== */
-
+/* Stop policy below is unchanged. */
 lift_stop_action_t lift_safety_policy_for(
     const lift_safety_context_t *context)
 {
@@ -105,10 +130,7 @@ lift_stop_action_t lift_safety_policy_for(
         return LIFT_STOP_CUT;
     }
 
-    /*
-     * 规则 1：已经确认有机械支撑，或车本来就落在地面上。
-     * 这两种情况下"断电"不会导致任何跌落，是【最快、最干净】的停机。
-     */
+    /* Legacy declared support selects zero output; physical support is unverified. */
     if ((context->support == LIFT_SUPPORT_MECHANICAL) ||
         (context->support == LIFT_SUPPORT_GROUND))
     {
@@ -124,15 +146,7 @@ lift_stop_action_t lift_safety_policy_for(
         return LIFT_STOP_CUT;
     }
 
-    /*
-     * 规则 3：悬空或支撑未知。区分"正在动作"和"停着"：
-     *   - 正在动作 → LOWER：受控降到停放点，比停在半空更可预测，
-     *                        也让人能安全靠近处理
-     *   - 停着     → HOLD：原地托住，不引入新的运动
-     *
-     * ⚠️ LIFT_SUPPORT_UNKNOWN 走的就是这一支，按"悬空"处理。
-     *    宁可多花保持电流，也不要赌"它应该撑住了"。
-     */
+    /* Preserve legacy moving/stationary request selection, not a safety proof. */
     return context->moving ? LIFT_STOP_LOWER : LIFT_STOP_HOLD;
 }
 
@@ -158,15 +172,14 @@ void lift_stop_apply(
 
     if ((config == NULL) || (state == NULL) || (out_current == NULL))
     {
-        if (out_active != NULL)
-        {
-            *out_active = false;
-        }
+        if (out_active != NULL) *out_active = false;
+        if (out_current != NULL)
+            for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++) out_current[ch] = 0;
         return;
     }
 
     /* 出力 = min(标定保持电流, 上限)；<= 0 时 HOLD/LOWER 退化成 CUT。 */
-    magnitude = config->hold_current;
+    magnitude = config->current_limit > 0 ? config->hold_current : 0;
     if ((config->current_limit > 0) && (magnitude > config->current_limit))
     {
         magnitude = config->current_limit;
@@ -181,21 +194,14 @@ void lift_stop_apply(
         case LIFT_STOP_HOLD:
             if (magnitude <= 0)
             {
-                /* 没标定保持电流 → 唯一已知安全的动作是断电。 */
+                /* 没标定保持电流 → 输出零电流；不代表机构具备安全支撑。 */
                 for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
                 {
                     out_current[ch] = 0;
                 }
                 break;
             }
-            /*
-             * 四轴同向给【抬升方向】的电流把车托在原地。
-             *
-             * 为什么不在四轴之间按位置差分配：HOLD 的前提是"已经出故障"，
-             * 此时最不该做的就是引入新的、未经验证的横向载荷转移。
-             * 四轴同向、同幅值是这里唯一站得住的策略；真正的调平是正常
-             * 控制链的职责，故障态不抢它的活。
-             */
+            /* Legacy equal positive currents. No position or support regulation here. */
             for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
             {
                 out_current[ch] = magnitude;
@@ -213,16 +219,9 @@ void lift_stop_apply(
                 }
                 break;
             }
-            /*
-             * ★ 全体一起降，不许「各停各的」。
-             *
-             * 老的真实缺陷就是逐轴到位逐轴停：一根停住、其余还在降，
-             * 车是在【倾斜中】被放下的，而这一步恰恰发生在系统已经出故障之后。
-             *
-             * 所以判据是【四轴都到停放点】才整体停止出力；只要还有一根没到，
-             * 四根就都保持同一个下降电流 —— 牺牲一点停放精度，换取下放过程
-             * 全程保持姿态。反正到了停放点就没有下一段动作了。
-             */
+            /* Legacy group park predicate/equal negative currents, retained unchanged.
+             * Equal currents do not prove equal travel, stable posture or slow descent.
+             * The top executor also enforces each axis' existing soft boundaries. */
             {
                 bool any_not_parked = false;
 

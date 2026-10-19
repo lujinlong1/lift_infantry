@@ -15,5 +15,8 @@ typedef struct
 
 #define portTICK_PERIOD_MS   1U
 #define pdMS_TO_TICKS(ms)    ((TickType_t)(ms))
+/* Single-threaded host harness; target uses the real FreeRTOS macros. */
+#define taskENTER_CRITICAL() do { } while (0)
+#define taskEXIT_CRITICAL() do { } while (0)
 
 #endif

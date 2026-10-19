@@ -147,6 +147,8 @@ static lift_seq_input_t base_input(void)
     uint32_t ch;
 
     (void)memset(&in, 0, sizeof(in));
+    in.recovery_confirmed = true; /* positive fixture: explicit support declaration */
+    in.motion_command_disabled = true;
     in.homed = true;
     in.calibrated = true;
     in.layout_confirmed = true;

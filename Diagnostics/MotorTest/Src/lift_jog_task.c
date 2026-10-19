@@ -4,6 +4,7 @@
 #include "dji_motor.h"
 #include "FreeRTOS.h"
 #include "lift_safety.h"
+#include "lift_lock.h"
 #include "pid.h"
 #include "robot_motor_commands.h"
 #include "robot_motors.h"
@@ -364,7 +365,11 @@ static void lift_test_zero_output(void)
      * 写 0 还有两个时刻需要，但那不是台架的活：
      *   · 参数未生效 / 掉线 → 主链的门禁会主动写 0（那是保护动作）
      */
-    if (lift_owner_current() != LIFT_OWNER_JOG)
+    const uint32_t owner_key = lift_lock_enter();
+    const bool owns_output = lift_owner_current() == LIFT_OWNER_JOG;
+    if (owns_output) robot_lift_set_currents(0, 0, 0, 0);
+    lift_lock_exit(owner_key);
+    if (!owns_output)
     {
         /* 通道不是自己的：只把状态清干净，绝不碰 CAN 电流 */
         g_lift_jog_status.running = false;
@@ -384,7 +389,6 @@ static void lift_test_zero_output(void)
         return;
     }
 
-    robot_lift_set_currents(0, 0, 0, 0);
     g_lift_jog_status.running = false;
     g_lift_jog_status.active = false;
 
@@ -974,65 +978,32 @@ static void lift_test_apply(const int16_t currents[LIFT_CHANNEL_COUNT])
         return;   /* 守卫内部已经把 CAN 电流写成 0 了 */
     }
 
-    /*
-     * ★★ 认领命令通道（2026-10-11）。
-     *
-     * 台架要出力，就必须先拿到这一组电流的所有权 —— 否则主链可能在同一
-     * 个 2 ms 发送窗口里也写一次，两边互相覆盖。
-     *
-     * ── 2026-10-11 第二次修：改成"可以抢占" ────────────────────────────
-     *
-     * 第一版是"抢不到就算了（静默 return）"。那是错的：主链每 5 ms 也会
-     * 认领同一个通道，两个任务同周期同优先级，于是台架会**频繁抢不到** ——
-     * 现象是"闭环在跑、目标也在、电流却是 0"，而且时好时坏（取决于调度顺序），
-     * 看起来像 PID 没调好，实际上是**命令通道被主链占着**。
-     *
-     * 现在：台架是**显式的人在调试**，优先级应该高于主链的自动输出。
-     * 所以先看通道在谁手里：
-     *   · 空着 / 是自己的        → 直接认领
-     *   · 主链占着              → **先让主链放手**（release），再认领
-     *   · CAN 测试占着          → 不抢（那是发送层整帧替换，抢了也没用），
-     *                             记一笔 own_lost_count，让操作手看得见
-     *
-     * ⚠️ 让主链放手是安全的：主链每周期都会重新判断"现在该不该我写"，
-     *    它下一拍自然会拿回去；而台架认领后一直持有到收尾
-     *    （见 lift_test_end），期间主链本来就不该写。
-     */
+    /* Explicit handover preserves bench priority, but never impersonates
+     * CONTROL by releasing its lease. Claim and final cache write are atomic. */
     {
-        const lift_owner_t owner_now = lift_owner_current();
-
-        if ((owner_now != LIFT_OWNER_NONE) && (owner_now != LIFT_OWNER_JOG) &&
-            (owner_now != LIFT_OWNER_CONTROL))
+        lift_owner_t previous;
+        const uint32_t key = lift_lock_enter();
+        const bool acquired = lift_owner_claim_override(LIFT_OWNER_JOG,
+            osKernelGetTickCount(), &previous);
+        if (acquired) robot_lift_set_currents(currents[0], currents[1], currents[2], currents[3]);
+        lift_lock_exit(key);
+        if (!acquired)
         {
-            /* CAN 测试占着：这是发送层的整帧替换，台架抢不到 */
+            if (lift_owner_tests_inhibited())
+                lift_test_end(LIFT_TEST_END_FAULT_INHIBIT);
             g_lift_jog_status.own_lost = true;
+            taskENTER_CRITICAL();
+            g_lift_jog_status.own_lost_tick_ms = osKernelGetTickCount() * portTICK_PERIOD_MS;
             g_lift_jog_status.own_lost_count++;
-            g_lift_jog_status.own_holder = (uint8_t)owner_now;
+            taskEXIT_CRITICAL();
+            g_lift_jog_status.own_holder = (uint8_t)previous;
             g_lift_jog_status.running = false;
             return;
         }
-
-        if (owner_now == LIFT_OWNER_CONTROL)
-        {
-            /* 主链占着：让位（它不是人，可以下一拍再拿回去） */
-            lift_owner_release(LIFT_OWNER_CONTROL);
-            g_lift_jog_status.own_preempt_count++;
-        }
-
-        if (!lift_owner_claim(LIFT_OWNER_JOG, osKernelGetTickCount()))
-        {
-            g_lift_jog_status.own_lost = true;
-            g_lift_jog_status.own_lost_count++;
-            g_lift_jog_status.own_holder = (uint8_t)lift_owner_current();
-            g_lift_jog_status.running = false;
-            return;
-        }
+        if (previous == LIFT_OWNER_CONTROL) g_lift_jog_status.own_preempt_count++;
         g_lift_jog_status.own_lost = false;
         g_lift_jog_status.own_holder = (uint8_t)LIFT_OWNER_JOG;
     }
-
-    robot_lift_set_currents(
-        currents[0], currents[1], currents[2], currents[3]);
     for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
     {
         g_lift_jog_status.axis_output_current[ch] = currents[ch];
@@ -1304,6 +1275,17 @@ static void lift_test_update(uint32_t now)
     const uint8_t mode = g_lift_test.mode;
     const bool enabled = lift_test_mode_enabled(mode);
 
+    if (lift_owner_tests_inhibited())
+    {
+        lift_test_end(LIFT_TEST_END_FAULT_INHIBIT);
+        g_lift_test.per_axis.enabled = false;
+        g_lift_test.length.enabled = false;
+        g_lift_test.force.enabled = false;
+        lift_test_zero_output();
+        lift_owner_release(LIFT_OWNER_JOG);
+        (void)lift_test_should_start(false, mode);
+        return;
+    }
     /* ---- 先采样：与 enabled 无关 ---- */
     lift_test_sample();
 

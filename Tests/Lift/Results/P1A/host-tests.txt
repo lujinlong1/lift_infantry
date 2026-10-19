@@ -1,0 +1,352 @@
+=== lift_owner_concurrency ===
+PASS: 120000 competing claims, wrong/repeat release, atomic handover, timeout/wrap/stale tick, nested cache transaction
+  OK (lift_owner_concurrency)
+
+=== lift_diag_concurrency ===
+PASS: concurrent live/history/rearm/cache/TX snapshots: 3445/26/45677 accepted
+  OK (lift_diag_concurrency)
+
+=== lift_telemetry ===
+PASS: immutable DMA buffer, pending UART TC, busy/error/recovery, source 0/1/2/3 layout, 200 continuous frames
+  OK (lift_telemetry)
+
+=== lift_diagnostics ===
+frame=568 history=59096 bytes
+PASS: history/wrap/latch/post/rearm/all reasons/saturation/bounded snapshots/transport
+  OK (lift_diagnostics)
+
+=== lift_transport ===
+PASS: real cache clamp/provenance/packet bytes/send failures/timeout/jog/CAN override/zero hold
+  OK (lift_transport)
+
+=== chassis_stair ===
+stair ownership, spin isolation, zero command, stale lease and offline stop passed
+  OK (chassis_stair)
+
+=== lift_axes ===
+P0 task: cycle/parameter/sign/stages/offline/guard/owner/homing/blackbox passed
+conditional integration and unwind passed
+task routing, PRECHECK, calibration, freshness and bench gate passed
+axis hold, asymmetric feedforward, current slew, bounds and sync passed
+axis0 hold error 224.2 ecd, velocity 17.0, supporting current 1534
+axis1 hold error 228.3 ecd, velocity 16.5, supporting current 1833
+axis2 hold error 239.5 ecd, velocity 16.5, supporting current 3533
+axis3 hold error 251.5 ecd, velocity 16.5, supporting current 4033
+unequal load plant and reference reversal passed
+front extension/contact datum, rear zero and watchdog arming passed
+all-axis -1000 count startup boundary and unchanged output limits passed
+one-click lift, startup fault retry and homing/busy/fault gates passed
+fault snapshot retains pre-stop targets/stage across refresh/reset and replaces on next fault
+200mm lift-only test: exact pause, resume, >60s hold, descent and offline fault passed
+stationary software startup datum and moving/offline rejection passed
+provisional front/rear travel expansion and stalled-motion powered pause passed
+stair startup, per-leg odometry, stop/settle, stall and powered resume passed
+runtime stair distance input, retained progress, validation and timed wait passed
+startup rejection records motor, offline age or speed; retry remains explicit
+standalone/stair 200mm startup targets and currents match through stall pause
+all active axis-chain tests passed
+  OK (lift_axes)
+
+=== lift_homing ===
+lift_homing 单元测试
+  [1] 正常找零
+  [2] 启动瞬间速度为 0 不得误判
+  [3] 一直碰不到死点 -> 超时故障
+  [4] 反馈丢失
+  [5] 未启动时不得输出电流
+  [6] 中途中止
+  [7] 碰到死点却退不出来 -> 故障
+  [8] 重复找零并更新零点
+  [9] 配置写超量时被硬限幅兜住
+  [11] 前置段：先离开死点再找零
+  [12] 前置段走不动时报专用故障码
+  [13] 贴在死点上且无前置段 -> SEEK_TIMEOUT（前置段存在的理由）
+  [10] 空指针不崩
+
+共 74 项断言，失败 0 项
+结果：全部通过
+  OK (lift_homing)
+
+=== lift_guard ===
+lift_guard 单元测试
+  [1] 未找零时任何运动命令都不得通过
+  [2] 正常通路与硬限幅
+  [3] 任一轴离线立即归零并锁存
+  [4] 命令超时不得归零，必须受控缓降
+  [5] 缓降到下限后进入 PARKED
+  [5b] 缓降目标是【停放点】，不是行程下限
+  [6] 该降却不动 -> 堵转故障
+  [7] 一直降不到底 -> 超时故障
+  [8] 缓降途中命令恢复应立刻交还控制权
+  [9] 到上限后向外的电流被拦，向内的放行
+  [10] 到下限后向外的电流被拦，向内的放行
+  [11] 故障锁存，只有 reset 上升沿能清除
+  [12] 离线未消失时复位应立即重新报故障
+  [13] 方向取反的通道：限位与缓降都要按符号解释
+  [14] 配置写错时自动纠正
+  [15] 空指针不崩
+
+共 68 项断言，失败 0 项
+结果：全部通过
+  OK (lift_guard)
+
+=== lift_sync ===
+lift_sync 单元测试
+  [1] 矩形权重必须是正交基
+  [2] 自检必须能识别坏权重
+  [3] 纯高度指令应四轴等力
+  [4] 纯俯仰 / 纯横滚指令的符号
+  [5] 翘曲分量必须恒为 0（这是本模块存在的理由）
+  [6] 正变换必须把翘曲从其他三个模态里分离干净
+  [7] 正反变换的往返关系 forward(distribute(U)) = N x U
+  [8] 过约束现场：地面不平角时谁在较劲
+  [9] 空指针不崩
+
+共 205 项断言，失败 0 项
+结果：全部通过
+  OK (lift_sync)
+
+=== lift_kinematics ===
+lift_kinematics 运动学换算单元测试
+  [1] counts/mm 与机械常数自洽
+  [2] 0 mm / 200 mm / 正负方向
+      200 mm -> 150000 计数（四轴合计 600000）
+  [3] 正反换算一致性（往返误差 < 1 mm）
+  [4] 各轴不同零点
+  [5] 非法轴号 / 超范围 / 非法配置
+  [6] 标定就绪判据（没量过行程不得走绝对位置）
+  [7] 软限位与越界判定
+  [8] 编码器回绕
+  [9] 速度换算
+  [10] 四轴极差与偏差
+  [11] 标定报告与标称值偏差
+
+共 1029 项断言，失败 0 项
+结果：全部通过
+  OK (lift_kinematics)
+
+=== lift_safety ===
+lift_safety 命令通道所有权 + 故障停机策略单元测试
+  [1] 所有权：空闲时可认领，被别人占时拒绝
+  [2] 所有权：只有本人还得了
+  [2b] 所有权：台架空闲时不得抹掉主链的电流
+  [3] 所有权：认领方不刷新则自动失效
+  [4] 所有权：主链与台架的一轮交接
+  [5] 所有权：边界情形
+  [6] 策略：有支撑/落地 → CUT
+  [7] 策略：悬空 → 动作中 LOWER，静止时 HOLD
+  [8] 策略：支撑未知一律按悬空处理（不许赌）
+  [9] 执行：CUT 必须真的清零
+  [10] 执行：HOLD 给抬升方向的保持电流
+  [11] 执行：LOWER 往停放点走，且不允许「各停各的」
+  [12] 执行：空指针不崩、不误动
+  [13] 名称表完整（Watch / 日志用）
+
+共 173 项断言，失败 0 项
+结果：全部通过
+  OK (lift_safety)
+
+=== lift_control ===
+lift_control 单元测试
+  [1] 未使能时输出为零且不复位斜坡
+  [2] 首次使能不得产生冲击
+  [3] 目标斜坡 + 跟踪前馈
+  [4] 高度指令经 lift_sync 分配后四轴等力且翘曲为 0
+  [5] 横滚指令的符号方向
+  [6] 带速度反馈时内环必须参与计算
+  [7] speed_is_rotor 开关改变速度反馈量纲
+  [8] 权重不合法时自动回落到矩形布局
+  [9] 空指针不崩
+  [7] 接近减速：收窄的是速度指令，且收到非零下限
+  [8] 到位后刹停 → HOLD 只留保持前馈
+  [9] 逐级开放 + 电流斜坡（di/dt）
+  [10] 速度反馈低通
+
+共 253 项断言，失败 0 项
+结果：全部通过
+  OK (lift_control)
+
+=== lift_system ===
+lift 整链集成测试
+  [P0] 找零之前任何电流都不得下发
+  [P1] 四轴同时堵转找零
+  [P2] 使能抬升并观察收敛
+  [P3] 命令超时后受控缓降到底
+
+共 547 项断言，失败 0 项
+结果：全部通过
+  OK (lift_system)
+
+=== lift_top ===
+lift_top 编排单元测试
+  [1] 未找零门禁
+  [2] 四轴找零
+      READY at t=610:
+        ch0 raw=-2400 zero=-3000 homed=600
+        ch1 raw=39400 zero=40000 homed=600
+        ch2 raw=-2400 zero=-3000 homed=600
+        ch3 raw=39400 zero=40000 homed=600
+  [3] 抬升收敛
+  [4] 命令超时受控缓降
+  [5] 重新找零必须两步
+  [6] 找零失败必须整组锁存
+  [7] 复位后重新找零
+  [8] 空指针不崩
+
+共 49 项断言，失败 0 项
+结果：全部通过
+  OK (lift_top)
+
+=== lift_seq ===
+lift_seq 分阶段上台阶状态机单元测试（全部使用模拟反馈）
+  [1] 正常完整流程（按序走完全部阶段）
+  [2] 启动前置检查：五道闸门
+  [3] 前部支撑未确认：等在原地，绝不当成「已经撑住」
+  [4] 后部支撑未确认：同样等在原地
+  [5] 安全闸报故（反馈失效）→ 任何阶段都必须停
+  [6] 限位触发 → 故障
+  [7] 同组一根卡死 → 堵转看门狗必须报故障
+  [8] 状态超时
+  [9] 中止 → 锁存 → 未复位不得继续动作
+  [10] 故障停机策略：悬空不切断，落地/人力解除才切断
+  [11] 前轮压空：前部收不动 → 必须报故障并原地停下
+  [12] 配置校验与边界情形
+  [13] 接触信号接口：接了开关之后判据自动升级
+
+共 1340 项断言，失败 0 项
+结果：全部通过
+  OK (lift_seq)
+
+=== lift_geometry ===
+lift_geometry 换算单元测试
+  [1] 直连默认配置：一圈 = 一个导程
+  [2] 反向换算
+  [3] 往返一致性（整圈倍数必须精确）
+  [4] 电机到丝杆有减速时
+  [5] 转速语义开关：转子侧 / 输出侧
+  [6] 非法配置一律返回 0
+  [7] 极端值饱和而不是回绕
+  [8] 空指针不崩
+
+共 144 项断言，失败 0 项
+结果：全部通过
+  OK (lift_geometry)
+
+=== lift_properties ===
+lift 性质测试（随机化不变量，种子 0x1A2B3C4D）
+  [P1] lift_sync：反变换的翘曲分量恒为 0，且正反变换互为伴随
+  [P2] lift_guard：输出不超限；故障必全零；未找零必全零
+  [P3] lift_homing：只有工作状态才允许输出，且不超限
+  [P4] lift_geometry：往返一致；非法配置一律返回 0
+  [P5] lift_control：模态控制量不超 PID 输出上限；到位标志与误差一致
+  [P6] lift_top：未找零且未找零中则零输出；故障则零输出
+  [P7] lift_seq：command_valid 只在工作中为真；故障必须锁存
+
+共 2168411 项断言，失败 0 项
+结果：全部通过
+  OK (lift_properties)
+
+=== lift_jog ===
+lift_jog 串级 + 电流斜坡 单元测试
+
+[1] rpm → axis_speed_ecd_s 换算与方向
+[2] 电流斜坡（di/dt 限幅）
+[3] 串级量纲（位置环=速度，速度环=电流）
+[4][5] 闭环收敛 / 停住 / 电流受限
+      轴0：位置 4898 / 目标 5000，峰值电流 7700，最大单拍变化 300
+[6] 使能上升沿清斜坡缓存
+[7] LENGTH 模式（四轴定长，同一条串级）
+      四轴最终位置 -2844 / -2844 / -2844 / -2844
+[9] PID 实时映射（改完立刻生效，不用重开 enabled）
+      积分：20 拍后 1020，100 拍后 5640
+[10] 减速 / 刹停 / 保持（用户实测四条要求）
+      刚使能：电流上限 = 2000（应为 current_limit_start=2000）
+      0.5 s 后：电流上限 = 7000（应 ≈ 7000）
+      误差 3000：目标速度 = 2250（应收窄到 2250），电流上限仍 16000
+      跑完：位置 4219（误差 -781），状态 = 2（2 = HOLD），电流 = -4200
+      稳住后 200 拍峰峰值 = 9 计数
+[11] 出厂默认值带载运行（kp = 5 / 2，目标斜坡 10000，低通 20 ms）
+      位置 4269（误差 -731），峰值电流 16000，状态 2
+[13] 掉线保护（四轴必须全在线才允许出力）
+  [14] axis_scale=0 关轴 / enabled 上升沿才启动
+[15] LENGTH 跟踪斜坡不提前完成 / 结束后不再写电流
+[16] 其他轴的减速限幅独立于轴 0
+[17] 结束快照冻结 / 自动归零 / 立即重新使能 / 模式切换
+[8] 调参参考（目标 5000 计数；超调 % / 稳态误差）
+      表A：速度上限 × 斜坡 × kp_pos（tau=0.10）
+      速度  斜坡  kp_pos    tau | 超调%   误差
+      A   2500   25000       8   0.10 |   21.0      973
+      A   2500   25000      10   0.10 |   21.0      973
+      A   2500   25000      15   0.10 |   21.0      973
+      A   2500   25000      25   0.10 |   21.0      973
+      A   2500   40000       8   0.10 |   19.5      720
+      A   2500   40000      10   0.10 |   19.5      720
+      A   2500   40000      15   0.10 |   19.5      720
+      A   2500   40000      25   0.10 |   19.5      720
+      A   2500   60000       8   0.10 |   18.5      766
+      A   2500   60000      10   0.10 |   18.5      766
+      A   2500   60000      15   0.10 |   18.5      766
+      A   2500   60000      25   0.10 |   18.5      766
+      A   2500   80000       8   0.10 |   17.9      733
+      A   2500   80000      10   0.10 |   17.9      733
+      A   2500   80000      15   0.10 |   17.9      733
+      A   2500   80000      25   0.10 |   17.9      733
+      A   4000   25000       8   0.10 |   21.1      633
+      A   4000   25000      10   0.10 |   21.1      633
+      A   4000   25000      15   0.10 |   21.1      633
+      A   4000   25000      25   0.10 |   21.1      633
+      A   4000   40000       8   0.10 |   19.5      659
+      A   4000   40000      10   0.10 |   19.5      659
+      A   4000   40000      15   0.10 |   19.5      659
+      A   4000   40000      25   0.10 |   19.5      659
+      A   4000   60000       8   0.10 |   18.5      817
+      A   4000   60000      10   0.10 |   18.5      817
+      A   4000   60000      15   0.10 |   18.5      817
+      A   4000   60000      25   0.10 |   18.5      817
+      A   4000   80000       8   0.10 |   17.9      720
+      A   4000   80000      10   0.10 |   17.9      720
+      A   4000   80000      15   0.10 |   17.9      720
+      A   4000   80000      25   0.10 |   17.9      720
+      表B：时间常数 × kp_pos（速度 2500，斜坡 60000）
+      B   2500   60000       8   0.03 |   18.5      766
+      B   2500   60000      10   0.03 |   18.5      766
+      B   2500   60000      15   0.03 |   18.5      766
+      B   2500   60000      25   0.03 |   18.5      766
+      B   2500   60000       8   0.10 |   18.5      766
+      B   2500   60000      10   0.10 |   18.5      766
+      B   2500   60000      15   0.10 |   18.5      766
+      B   2500   60000      25   0.10 |   18.5      766
+      B   2500   60000       8   0.30 |   18.5      766
+      B   2500   60000      10   0.30 |   18.5      766
+      B   2500   60000      15   0.30 |   18.5      766
+      B   2500   60000      25   0.30 |   18.5      766
+
+共 240 项断言，失败 0 项
+结果：全部通过
+  OK (lift_jog)
+
+
+=== firmware compile check ===
+=== compile-check lift_diagnostics.c ===
+  OK (lift_diagnostics.c)
+
+=== compile-check chassis_control.c ===
+  OK (chassis_control.c)
+
+=== compile-check lift_control_task.c ===
+  OK (lift_control_task.c)
+
+=== compile-check lift_top.c ===
+  OK (lift_top.c)
+
+=== compile-check lift_seq.c ===
+  OK (lift_seq.c)
+
+=== compile-check lift_safety.c ===
+  OK (lift_safety.c)
+
+=== compile-check lift_kinematics.c ===
+  OK (lift_kinematics.c)
+
+RESULT: all firmware lift sources compile clean
+RESULT: all suites passed

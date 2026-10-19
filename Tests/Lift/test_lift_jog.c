@@ -1527,8 +1527,47 @@ static void t_end_snapshot(void)
                g_lift_test_snapshot.status.running, "快照标识 FORCE 保持阶段");
 }
 
+static void t_owner_handover(void)
+{
+    lift_owner_t previous;
+    reset_all();
+    (void)lift_owner_claim(LIFT_OWNER_CONTROL,g_now);
+    uint32_t old_count=g_cmd_count;
+    lift_test_zero_output();
+    check_int((int32_t)g_cmd_count,(int32_t)old_count,"idle JOG cannot zero CONTROL cache");
+    check_int(lift_owner_current(),LIFT_OWNER_CONTROL,"idle JOG cannot release CONTROL");
+    check_true(lift_owner_claim_override(LIFT_OWNER_JOG,g_now,&previous),"explicit JOG handover");
+    check_int(previous,LIFT_OWNER_CONTROL,"handover reports previous owner");
+    check_true(lift_owner_claim_override(LIFT_OWNER_CAN_TEST,g_now,&previous),"CAN handover from JOG");
+    lift_test_zero_output();lift_owner_release(LIFT_OWNER_JOG);
+    check_int((int32_t)g_cmd_count,(int32_t)old_count,"preempted JOG cannot zero CAN cache");
+    check_int(lift_owner_current(),LIFT_OWNER_CAN_TEST,"preempted JOG cannot release CAN");
+    lift_owner_release(LIFT_OWNER_CAN_TEST);
+}
+
+
+static void t_fault_inhibit(void)
+{
+    reset_all();
+    g_lift_test.mode=LIFT_TEST_MODE_LENGTH;
+    g_lift_test.length.enabled=true;
+    lift_test_update(g_now);
+    check_true(test_running,"fixture bench starts before fault");
+    lift_owner_inhibit_tests(true);
+    check_int(lift_owner_current(),LIFT_OWNER_NONE,"fault revokes bench lease atomically");
+    lift_test_update(++g_now);
+    check_true(!test_running && !g_lift_test.length.enabled,"fault clears pending bench enable");
+    check_int(g_lift_test_snapshot.reason,LIFT_TEST_END_FAULT_INHIBIT,"fault shutdown reason retained");
+    lift_owner_inhibit_tests(false);
+    uint32_t count=g_cmd_count;
+    lift_test_update(++g_now);
+    check_true(!test_running,"recovery does not restart JOG");
+    check_int(g_cmd_count,count,"recovery does not write an unsolicited bench frame");
+}
+
 int main(void)
 {
+    t_fault_inhibit();
     printf("lift_jog 串级 + 电流斜坡 单元测试\n\n");
 
     /* g_lift_control_debug 的 default 由 lift_control 模块提供；
@@ -1540,6 +1579,7 @@ int main(void)
             ((ch == 0U) || (ch == 2U)) ? -1 : 1;
     }
 
+    t_owner_handover();
     t_speed_conversion();
     t_ramp();
     t_cascade_units();

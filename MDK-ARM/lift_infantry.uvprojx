@@ -1298,6 +1298,11 @@
               <FilePath>..\Application\Lift\Inc\lift_top.h</FilePath>
             </File>
             <File>
+              <FileName>lift_diagnostics.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Application\Lift\Src\lift_diagnostics.c</FilePath>
+            </File>
+            <File>
               <FileName>lift_control.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Application\Lift\Src\lift_control.c</FilePath>

@@ -297,7 +297,7 @@ void remote_lift_map(
                 actual_height = remote_lift_clamp_i32(
                     actual_height, height_min, height_max);
             }
-            lift_control_set_target(actual_height, 0, 0);
+            lift_control_set_target_from(LIFT_DIAG_SOURCE_REMOTE, actual_height, 0, 0);
             g_remote_lift_status.target_height_ecd = actual_height;
             g_remote_lift_status.actual_height_ecd = actual_height;
             g_remote_lift_status.refresh_count++;
@@ -328,7 +328,7 @@ void remote_lift_map(
                 actual_height, height_min, height_max);
         }
 
-        lift_control_set_target(actual_height, 0, 0);
+        lift_control_set_target_from(LIFT_DIAG_SOURCE_REMOTE, actual_height, 0, 0);
         lift_control_enable(true);
         g_remote_lift_status.enabled = true;
         g_remote_lift_status.target_height_ecd = actual_height;
@@ -409,7 +409,7 @@ void remote_lift_map(
          * 姿态目标每周期写 0：落地歪车时不靠姿态 PID 去"拧"回来，而是让
          * 四条通道各自回到同一高度（水平由机械与地面决定，不靠内力硬顶）。
          */
-        lift_control_set_target(target, 0, 0);
+        lift_control_set_target_from(LIFT_DIAG_SOURCE_REMOTE, target, 0, 0);
 
         g_remote_lift_status.enabled = true;
         g_remote_lift_status.target_height_ecd = target;

@@ -1,0 +1,2 @@
+lift_ctrl: linked stack 8192 bytes; reported depth 4256 bytes; reserve 1024 bytes
+PASS: lift task static stack budget

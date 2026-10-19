@@ -498,7 +498,7 @@ static void test_stop_null_safety(void)
     CHECK(!active, "空参数时不得报「在执行」");
     for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
     {
-        CHECK(out[ch] == 1, "空参数时不得改动输出（由调用方负责清零）");
+        CHECK(out[ch] == 0, "invalid stop parameters clear stale output");
     }
 
     /* out_active 允许为 NULL */

@@ -39,9 +39,18 @@ $fullSrc = @((LiftSrc 'lift_control.c'), (LiftSrc 'lift_sync.c'),
              (LiftSrc 'lift_guard.c'), (LiftSrc 'lift_homing.c'),
              $kinSrc, $safeSrc, $pidSrc)
 
+$motorInc = Join-Path $fwRoot 'Devices\RobotMotors\Inc'
+$djiInc = Join-Path $fwRoot 'Devices\DjiMotor\Inc'
+$canInc = Join-Path $fwRoot 'Services\Can\Inc'
+$configInc = Join-Path $fwRoot 'Config\Inc'
 $suites = @(
+    @{ name = 'lift_owner_concurrency'; src = @($safeSrc); inc = @($liftInc); threaded = $true },
+    @{ name = 'lift_diag_concurrency'; src = @((LiftSrc 'lift_diagnostics.c'), $safeSrc); inc = @($liftInc); threaded = $true },
+    @{ name = 'lift_telemetry'; src = @((LiftSrc 'lift_diagnostics.c'), $safeSrc); inc = @((Join-Path $dir 'telemetrystubs'), (Join-Path $dir 'fwstubs'), (Join-Path $fwRoot 'Diagnostics\Telemetry\Inc'), $liftInc, $jogInc, $pidInc) },
+    @{ name = 'lift_diagnostics'; src = @((LiftSrc 'lift_diagnostics.c'), $safeSrc); inc = @($liftInc) },
+    @{ name = 'lift_transport'; src = @((LiftSrc 'lift_diagnostics.c'), $safeSrc, (Join-Path $fwRoot 'Devices\DjiMotor\Src\dji_motor.c')); inc = @($motorInc, $djiInc, $canInc, $configInc, (Join-Path $dir 'fwstubs'), $liftInc) },
     @{ name = 'chassis_stair'; src = @($pidSrc); inc = @((Join-Path $dir 'fwstubs'), $chassisInc, $pidInc) },
-    @{ name = 'lift_axes'; src = ($fullSrc + @((LiftSrc 'lift_top.c'), (LiftSrc 'lift_seq.c'))); inc = @((Join-Path $dir 'fwstubs'), $liftInc, $pidInc, $jogInc) },
+    @{ name = 'lift_axes'; src = ($fullSrc + @((LiftSrc 'lift_top.c'), (LiftSrc 'lift_seq.c'), (LiftSrc 'lift_diagnostics.c'))); inc = @((Join-Path $dir 'fwstubs'), $liftInc, $pidInc, $jogInc) },
     @{ name = 'lift_homing';  src = @((LiftSrc 'lift_homing.c'));  inc = @($liftInc) },
     @{ name = 'lift_guard';   src = @((LiftSrc 'lift_guard.c'));   inc = @($liftInc) },
     @{ name = 'lift_sync';    src = @((LiftSrc 'lift_sync.c'));    inc = @($liftInc) },
@@ -68,6 +77,7 @@ try {
         Write-Host ("=== " + $s.name + " ===")
 
         $gccArgs = @('-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror')
+        if ($s.threaded) { $gccArgs += '-pthread' }
         $gccArgs += ('test_' + $s.name + '.c')
         $gccArgs += $s.src
         foreach ($i in $s.inc) { $gccArgs += ('-I' + $i) }

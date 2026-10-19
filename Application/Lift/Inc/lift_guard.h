@@ -95,6 +95,7 @@ typedef struct
     int16_t output_current[LIFT_CHANNEL_COUNT];
     bool    limit_blocked[LIFT_CHANNEL_COUNT];  /* 该轴因软限位被拦 */
     bool    at_target[LIFT_CHANNEL_COUNT];      /* 缓降目标已到达 */
+    int8_t fault_axis; /* diagnostic only: -1 means group-wide */
     uint32_t descent_elapsed_ms;
 } lift_guard_output_t;
 
@@ -103,6 +104,7 @@ typedef struct
     lift_guard_config_t config;
     lift_guard_state_t  state;
     lift_guard_fault_t  fault;
+    int8_t fault_axis; /* diagnostic latch */
     uint32_t descent_start_ms;
     uint32_t stall_start_ms[LIFT_CHANNEL_COUNT];
     bool     stall_active[LIFT_CHANNEL_COUNT];

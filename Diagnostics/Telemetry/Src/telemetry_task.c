@@ -33,6 +33,8 @@
 
 telemetry_status_t g_telemetry_status;
 
+/* One task owns USART1 TX and this snapshot staging buffer. */
+static lift_diag_frame_t snapshot;
 static osThreadId_t telemetry_task_handle;
 static StaticTask_t telemetry_task_control;
 static StackType_t  telemetry_task_stack[TELEMETRY_TASK_STACK_WORDS];
@@ -50,6 +52,7 @@ static const uint8_t telemetry_tail[4] = {0x00U, 0x00U, 0x80U, 0x7FU};
  */
 static uint32_t telemetry_build_pitch_frame(void)
 {
+    taskENTER_CRITICAL();
     const float values[TELEMETRY_PITCH_CHANNELS] = {
         g_remote_mapping_status.pitch_raw_rate_deg_s,
         g_remote_mapping_status.pitch_filtered_rate_deg_s,
@@ -59,6 +62,7 @@ static uint32_t telemetry_build_pitch_frame(void)
         g_pitch_control_status.measured_angle_deg,
         g_pitch_control_status.commanded_velocity_deg_s,
         g_pitch_control_status.measured_velocity_deg_s};
+    taskEXIT_CRITICAL();
 
     (void)memcpy(telemetry_frame, values, sizeof(values));
     return sizeof(values);
@@ -82,6 +86,7 @@ static uint32_t telemetry_build_lift_frame(void)
     float values[TELEMETRY_LIFT_CHANNELS];
     uint32_t ch;
 
+    taskENTER_CRITICAL();
     for (ch = 0U; ch < 4U; ch++)
     {
         const uint32_t base = ch * TELEMETRY_LIFT_CHANNELS_PER_AXIS;
@@ -95,6 +100,7 @@ static uint32_t telemetry_build_lift_frame(void)
         values[base + 6U] = (float)g_lift_jog_status.axis_given_current[ch];
     }
 
+    taskEXIT_CRITICAL();
     (void)memcpy(telemetry_frame, values, sizeof(values));
     return sizeof(values);
 }
@@ -106,19 +112,62 @@ static uint32_t telemetry_build_lift_control_frame(void)
     float values[TELEMETRY_LIFT_CHANNELS];
     uint32_t ch;
 
-    taskENTER_CRITICAL();
+    /* Static staging avoids growing the 2KB telemetry task stack. A failed
+     * bounded read drops this telemetry frame; never wait on the controller. */
+    if (!lift_diag_get_snapshot(&snapshot)) return 0U;
     for (ch = 0U; ch < 4U; ch++)
     {
         const uint32_t base = ch * TELEMETRY_LIFT_CHANNELS_PER_AXIS;
-        values[base + 0U] = (float)g_lift_control_status.homed_position_ecd[ch];
-        values[base + 1U] = (float)g_lift_control_status.axis_target_ecd[ch];
-        values[base + 2U] = g_lift_control_status.axis_final_current[ch];
-        values[base + 3U] = g_lift_control_status.axis_speed_ecd_s[ch];
-        values[base + 4U] = g_lift_control_status.axis_target_speed_ecd_s[ch];
-        values[base + 5U] = g_lift_control_status.axis_limit_now[ch];
-        values[base + 6U] = (float)g_lift_control_status.axis_feedback_current[ch];
+        const lift_diag_axis_t *axis = &snapshot.axis[ch];
+        values[base + 0U] = (float)axis->position_ecd;
+        values[base + 1U] = (float)axis->target_ecd;
+        values[base + 2U] = (float)axis->direction * axis->submitted_raw;
+        values[base + 3U] = axis->actual_speed_ecd_s;
+        values[base + 4U] = axis->target_speed_ecd_s;
+        values[base + 5U] = axis->current_limit;
+        values[base + 6U] = (float)axis->feedback_current;
     }
-    taskEXIT_CRITICAL();
+    (void)memcpy(telemetry_frame, values, sizeof(values));
+    return sizeof(values);
+}
+
+/* One selected axis, full current chain. Same 28-float wire format. */
+static uint32_t telemetry_build_lift_diagnostics_frame(void)
+{
+    const uint32_t ch = g_telemetry_status.diagnostic_axis & 3U;
+    const lift_diag_axis_t *axis = &snapshot.axis[ch];
+    const lift_diag_transport_t *tx = &snapshot.transport;
+    float values[TELEMETRY_LIFT_CHANNELS];
+    if (!lift_diag_get_snapshot(&snapshot) || !snapshot.transport_valid) return 0U;
+    values[0] = (float)snapshot.cycle_id;
+    values[1] = (float)snapshot.parameter_version;
+    values[2] = (float)ch;
+    values[3] = (float)axis->target_ecd;
+    values[4] = axis->reference_ecd;
+    values[5] = (float)axis->position_ecd;
+    values[6] = axis->target_speed_ecd_s;
+    values[7] = axis->actual_speed_ecd_s;
+    values[8] = axis->pid_current;
+    values[9] = axis->feedforward_current;
+    values[10] = axis->demand_current;
+    values[11] = axis->limit_current;
+    values[12] = (float)axis->guard_current;
+    values[13] = (float)axis->protected_current;
+    values[14] = (float)axis->direction * axis->submitted_raw;
+    values[15] = (float)axis->direction * tx->cache_raw[ch];
+    values[16] = (float)axis->direction * tx->packed_raw[ch];
+    values[17] = (float)axis->feedback_current;
+    values[18] = (float)axis->feedback_age_ms;
+    values[19] = (float)snapshot.gate;
+    values[20] = (float)snapshot.reasons;
+    values[21] = (float)tx->cache_cycle_id;
+    values[22] = (float)tx->tx_cycle_id;
+    values[23] = (float)tx->send_result;
+    values[24] = (float)tx->failed_count;
+    values[25] = tx->ever_accepted ?
+        (float)(uint32_t)(snapshot.transport_observed_ms - tx->last_success_ms) : -1.0F;
+    values[26] = (float)axis->feedback_count;
+    values[27] = (float)snapshot.source;
     (void)memcpy(telemetry_frame, values, sizeof(values));
     return sizeof(values);
 }
@@ -134,8 +183,22 @@ static void telemetry_task(void *argument)
         if (g_telemetry_status.enabled)
         {
             uint32_t payload;
+            /* Check BEFORE any builder writes telemetry_frame. HAL owns the
+             * immutable buffer until DMA and final UART TC have completed.
+             * This task is the only USART1 TX producer in the project. */
+            if (huart1.gState != HAL_UART_STATE_READY ||
+                HAL_DMA_GetState(huart1.hdmatx) != HAL_DMA_STATE_READY)
+            {
+                g_telemetry_status.busy_count++;
+                vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+                continue;
+            }
 
-            if (g_telemetry_status.source ==
+            if (g_telemetry_status.source == (uint8_t)TELEMETRY_SOURCE_LIFT_DIAGNOSTICS)
+            {
+                payload = telemetry_build_lift_diagnostics_frame();
+            }
+            else if (g_telemetry_status.source ==
                 (uint8_t)TELEMETRY_SOURCE_LIFT_CONTROL)
             {
                 payload = telemetry_build_lift_control_frame();
@@ -150,6 +213,12 @@ static void telemetry_task(void *argument)
                 payload = telemetry_build_pitch_frame();
             }
 
+            if (payload == 0U)
+            {
+                g_telemetry_status.snapshot_drop_count++;
+                vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(TELEMETRY_PERIOD_MS));
+                continue;
+            }
             (void)memcpy(
                 &telemetry_frame[payload], telemetry_tail,
                 sizeof(telemetry_tail));

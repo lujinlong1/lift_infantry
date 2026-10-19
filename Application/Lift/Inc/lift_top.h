@@ -38,7 +38,7 @@ typedef enum
     LIFT_TOP_STATE_IDLE = 0,   /* 未找零，也没有正在找零 */
     LIFT_TOP_STATE_HOMING,     /* 正在找零 */
     LIFT_TOP_STATE_READY,      /* 已找零，接受运动命令 */
-    LIFT_TOP_STATE_FAULT       /* 故障锁存，输出全零 */
+    LIFT_TOP_STATE_FAULT       /* fault latched; bounded stop executor selects current */
 } lift_top_state_t;
 
 typedef enum
@@ -48,8 +48,14 @@ typedef enum
     LIFT_TOP_FAULT_GUARD,           /* 安全闸报故（离线 / 缓降异常） */
     LIFT_TOP_FAULT_SEQUENCE,
     LIFT_TOP_FAULT_ZERO_UNCONFIRMED, /* 已知最低点轴尚未确认，拒绝找零 */
-    LIFT_TOP_FAULT_ZERO_MOVING       /* 已知最低点轴仍在运动，拒绝置零 */
+    LIFT_TOP_FAULT_ZERO_MOVING,      /* 已知最低点轴仍在运动，拒绝置零 */
+    LIFT_TOP_FAULT_STATE            /* invalid state, no motion accepted */
 } lift_top_fault_t;
+
+typedef enum {
+    LIFT_DATUM_NONE = 0, LIFT_DATUM_SOFTWARE,
+    LIFT_DATUM_ENDSTOP, LIFT_DATUM_CONTACT, LIFT_DATUM_CONFIRMED_MIN
+} lift_datum_t;
 
 typedef struct
 {
@@ -88,8 +94,8 @@ typedef struct
      *   底盘悬空时断电 = 掉车。调用方（lift_control_task）按
      *   `lift_safety_policy_for()` 的结果填这里。
      *
-     * 约定：FAULT 之外的状态忽略本字段。填 CUT 是最保守的选择
-     * （也是"没有策略信息时"的默认行为）。
+     * 约定：FAULT 之外的状态忽略本字段。默认 CUT 仅表示零电流请求
+     * （不保证悬空机构停止或保持）。
      */
     lift_stop_action_t fault_stop_action;
     /*
@@ -104,6 +110,7 @@ typedef struct
     bool external_fault_request; /* sequence fault must reach the stop executor */
     uint8_t homing_known_zero_confirmed_mask;
     uint8_t homing_contact_confirmed_mask;
+    bool recovery_confirmed; /* one-shot declaration: mechanical support installed */
 } lift_top_input_t;
 
 typedef struct
@@ -113,7 +120,7 @@ typedef struct
     bool    homed;
     int32_t zero_ecd[LIFT_CHANNEL_COUNT];           /* 原始 total_ecd 死点位置 */
     int32_t homed_position_ecd[LIFT_CHANNEL_COUNT]; /* 已找零坐标 */
-    int16_t output_current[LIFT_CHANNEL_COUNT];     /* 最终下发电流 */
+    int16_t output_current[LIFT_CHANNEL_COUNT];     /* 原始方向保护后电流，待门禁/缓存 */
     lift_sync_modes_t actual_modes;                 /* 实际模态位置（ecd） */
     lift_sync_modes_t actual_modes_speed;           /* 实际模态速度（ecd/s） */
     lift_sync_modes_t ramped_target_ecd;            /* 斜坡后的目标模态位置 */
@@ -128,20 +135,17 @@ typedef struct
     lift_homing_fault_t homing_fault[LIFT_CHANNEL_COUNT];
     lift_guard_state_t  guard_state;
     lift_guard_fault_t  guard_fault;
-    /*
-     * ★ 故障态下【真实下发】的停机动作，以及它是否还在起作用。
-     *
-     * 这两个字段是"故障 = 断电掉车"这个隐患的可见化：
-     *   stop_action == CUT   → 四轴电流为 0（唯一安全的情形是车有支撑）
-     *   stop_action == HOLD  → 四轴在给保持电流托住车
-     *   stop_action == LOWER → 四轴在往停放点走
-     *   stop_active          → 动作还没完成
-     *   stop_capable == false → 保持电流没标定，HOLD/LOWER 会退化成 CUT
-     *                          （**这是能力缺口，必须让操作手看到**）
-     */
+    /* Fault executor request, bounded action and nonzero-request status only.
+     * CAN/cache/final packet evidence is in g_lift_diag. stop_capable remains
+     * false because the firmware has no validated physical stop capability. */
     lift_stop_action_t stop_action;
     bool    stop_active;
-    bool    stop_capable;
+    bool    stop_inhibited; /* electrical stop was disqualified; reset required */
+    bool    stop_capable; /* physical capability is unverified: always false */
+    bool    stop_output_configured;
+    lift_stop_action_t requested_stop_action;
+    uint8_t datum_kind[4];
+    uint32_t recovery_blocked;
     /*
      * 限位可见性：limit_blocked[] 正常应【始终为 false】。
      * 它为 true 说明上游模态限幅没兜住、guard 在用逐轴清零止损，
@@ -152,6 +156,11 @@ typedef struct
     lift_control_status_t control;
     int32_t control_effort_height;   /* lift_control 交给 lift_sync 的模态控制量 */
     bool    at_target;
+    /* Same-update diagnostic taps, before guard tracking overwrites control. */
+    bool controller_ran, guard_ran;
+    int32_t limited_current[4]; /* logical, pre-guard */
+    int16_t guard_current[4];   /* logical, before top fault-stop override */
+    int8_t fault_axis, guard_fault_axis;
 } lift_top_status_t;
 
 typedef struct
@@ -167,6 +176,8 @@ typedef struct
     bool    homing_last;
     bool    clear_last;
     bool    reset_last;
+    bool    fault_stop_inhibited;
+    uint8_t datum_kind[4];
     bool    motion_command_seen; /* watchdog arms after a fresh enabled command */
 } lift_top_t;
 
@@ -183,17 +194,10 @@ void lift_top_update(
     const lift_control_command_t *command,
     lift_top_status_t *status);
 
-/*
- * 【软零点】把四轴当前位置当作零点，直接进入 READY。
- *
- * 用途：台架调 PID 时跳过真实找零（省时、也避免找零时车要落地这一环）。
- *
- * ⚠️ 它不是真实找零：零点没有机械基准，机构一挪零点就"错"了。
- *    所以行程限位与堵转判定的意义都打折。
- *    **只在架空、有人看着的台架调试阶段用**；正式跑之前必须重新真实找零。
- *
- * @param raw_position 四轴原始编码器位置（与 in->position_ecd 同域）
- */
+/* Software datum only: allowed solely while IDLE, unhomed and fault-free.
+ * Stores the raw reference with LIFT_DATUM_SOFTWARE; remains IDLE/unhomed.
+ * It never grants motion eligibility or clears faults. Physical homing is needed.
+ * Caller must additionally require disabled commands, online/stationary motors. */
 void lift_top_set_zero_now(
     lift_top_t *self,
     const int32_t raw_position[LIFT_CHANNEL_COUNT]);
@@ -202,7 +206,7 @@ void lift_top_set_zero_now(
  * 【只重载控制参数】把新的 control 配置装进运行中的链，**不动零点、不动 homed**。
  *
  * 用途：调 PID 时改增益不能把零点作废（否则每调一次都要重新找零，没法调）。
- * 它只重建控制子模块（清 PID 状态与斜坡）和安全闸，保留 self->zero_ecd / homed。
+ * 无故障时重建控制子模块和安全闸，保留零点；故障时拒绝，不能用重载复位。
  */
 void lift_top_reload_control(
     lift_top_t *self,

@@ -99,7 +99,7 @@ typedef enum
 {
     LIFT_SEQ_STATE_IDLE = 0,          /* 等待启动 */
     LIFT_SEQ_STATE_PRECHECK,          /* 电机在线/零点/标定/限位/同步 前置检查 */
-    LIFT_SEQ_STATE_LIFT_CLEARANCE,    /* 四轴抬到标定过的安全高度（200 mm） */
+    LIFT_SEQ_STATE_LIFT_CLEARANCE,    /* request configured clearance; actual travel must be measured */
     LIFT_SEQ_STATE_VERIFY_CLEARANCE,  /* 确认高度/同步/姿态/电流都满足 */
     LIFT_SEQ_STATE_APPROACH_STEP,     /* 低速靠近台阶（人/底盘执行前进） */
     LIFT_SEQ_STATE_VERIFY_FRONT_SUPPORT,  /* 确认前部轮组已可靠支撑 */
@@ -116,7 +116,7 @@ typedef enum
     LIFT_SEQ_STATE_TEST_HOLD,         /* 16: lift-only test, hold target */
     LIFT_SEQ_STATE_TEST_PAUSED,       /* 17: hold measured encoder positions */
     LIFT_SEQ_STATE_TEST_LOWER,        /* 18: controlled return to retracted_mm */
-    LIFT_SEQ_STATE_TEST_PARKED,       /* 19: low position, still powered */
+    LIFT_SEQ_STATE_TEST_PARKED,       /* 19: low window, output latched OFF; no support proof */
     LIFT_SEQ_STATE_COUNT
 } lift_seq_state_t;
 
@@ -183,7 +183,9 @@ typedef struct
     bool abort_request;         /* 中止：进入 FAULT，按停机策略处理 */
     bool confirm_request;       /* 人工确认：支撑条件 / 前进动作已完成 */
     bool release_request;       /* 人力解除：已确认机械支撑，允许 FAULT 直接断电 */
-    bool reset_request;         /* 复位故障 */
+    bool reset_request;         /* explicit fault-reset pulse */
+    bool recovery_confirmed; /* one-shot mechanical support declaration */
+    bool motion_command_disabled;
     bool test_pause_request;
     bool test_resume_request;
     bool test_lower_request;
@@ -275,6 +277,7 @@ typedef struct
     /* 需要人做什么（静态字符串，不分配）。 */
     const char *operator_action;
     /* FAULT 的成因与相关轴，方便现场定位。 */
+    uint32_t recovery_blocked;
     const char *fault_detail;
     int32_t  fault_axis;        /* -1 = 与单轴无关 */
     uint32_t confirm_count;     /* 累计收到的确认次数 */

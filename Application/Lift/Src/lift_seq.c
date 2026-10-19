@@ -432,7 +432,9 @@ static void seq_fault(
 
     context.fault = fault;
     context.support = seq_support_now(self);
-    /* 能走到这里说明已经过了 PRECHECK 的找零/标定检查。 */
+    /* Legacy request selection assumes a datum here, including PRECHECK faults.
+     * This is not measured evidence; the top executor checks actual homed state
+     * and the task gates unconfirmed travel. Do not treat this as support proof. */
     context.homed = true;
     context.calibrated = true;
     context.moving = moving;
@@ -749,6 +751,14 @@ void lift_seq_update(
         self->confirm_count++;
     }
 
+    /* Reject invalid states before pause/release handlers can transform them. */
+    if ((unsigned)self->state >= (unsigned)LIFT_SEQ_STATE_COUNT)
+    {
+        seq_fault(self, LIFT_SAFETY_FAULT_UNSUPPORTED,
+            "invalid sequence state", -1, false, in->now_ms);
+        goto emit;
+    }
+
     /* ---- 人工解除：任何时刻都生效，包括 FAULT ---- */
     if (release_rising)
     {
@@ -772,6 +782,17 @@ void lift_seq_update(
     /* ---- 故障复位：只在故障态下接受复位沿 ---- */
     if (reset_rising && (self->state == LIFT_SEQ_STATE_FAULT))
     {
+        if (!in->recovery_confirmed) status->recovery_blocked |= LIFT_RECOVERY_SUPPORT;
+        if (!in->motion_command_disabled || in->start_request || in->abort_request)
+            status->recovery_blocked |= LIFT_RECOVERY_DISABLE;
+        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+        {
+            if (!in->axis_online[ch]) status->recovery_blocked |= LIFT_RECOVERY_OFFLINE;
+            if (in->speed_mm_s[ch] > self->config.settled_speed_mm_s ||
+                in->speed_mm_s[ch] < -self->config.settled_speed_mm_s)
+                status->recovery_blocked |= LIFT_RECOVERY_MOVING;
+        }
+        if (status->recovery_blocked != 0U) goto emit;
         lift_seq_reset(self);
         status->state = self->state;
         status->fault = self->fault;
@@ -805,6 +826,23 @@ void lift_seq_update(
     if (self->state == LIFT_SEQ_STATE_IDLE)
     {
         goto emit;
+    }
+
+    if (self->state != LIFT_SEQ_STATE_COMPLETE)
+    {
+        for (ch = 0U; ch < LIFT_CHANNEL_COUNT; ch++)
+            if (!in->axis_online[ch])
+            {
+                seq_fault(self, LIFT_SAFETY_FAULT_OFFLINE, "axis offline", (int32_t)ch, false, in->now_ms);
+                goto emit;
+            }
+        if (self->state != LIFT_SEQ_STATE_PRECHECK &&
+            (!in->homed || !in->calibrated || !in->layout_confirmed))
+        {
+            seq_fault(self, LIFT_SAFETY_FAULT_UNSUPPORTED,
+                "motion prerequisite lost", -1, false, in->now_ms);
+            goto emit;
+        }
     }
 
     /* ---- 上游安全闸报故：任何阶段都停 ---- */
@@ -1369,6 +1407,7 @@ void lift_seq_update(
 
     /* ---------------------------------------------------------------- */
     default:
+        seq_fault(self, LIFT_SAFETY_FAULT_UNSUPPORTED, "invalid sequence state", -1, false, in->now_ms);
         goto emit;
     }
 
